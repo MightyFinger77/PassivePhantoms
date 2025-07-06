@@ -108,8 +108,5 @@
 
 ## Planned Features
 
-- [ ] Configuration file for customizable behavior
 - [ ] Commands to toggle plugin on/off
-- [ ] Permissions system
-- [ ] Different aggression levels
-- [ ] Phantom size-based behavior
+- [ ] Add Projectile-aggression triggering 
