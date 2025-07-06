@@ -1,11 +1,16 @@
 name: PassivePhantoms
-version: 1.2.3
+version: 1.2.4
 main: PassivePhantoms
-api-version: 1.21
-description: Makes phantoms passive until they are attacked by a player
+api-version: 1.13
+description: Makes phantoms passive until they are attacked by a player or projectile
 
 commands:
   passivephantoms:
     description: Reload the PassivePhantoms configuration
-    usage: /<command> reload
-    permission: passivephantoms.reload 
+    usage: /<command> [reload]
+    permission: passivephantoms.reload
+
+permissions:
+  passivephantoms.reload:
+    description: Allows reloading the PassivePhantoms configuration
+    default: op 
