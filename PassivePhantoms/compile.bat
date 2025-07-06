@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-set JAR_VERSION=1.2.3
+set JAR_VERSION=1.2.4
 set JAR_NAME=PassivePhantoms-%JAR_VERSION%.jar
 set TARGET_DIR=target
 set MAVEN_PATH=%USERPROFILE%\maven\apache-maven-3.9.6\bin\mvn.cmd
