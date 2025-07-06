@@ -55,6 +55,10 @@ The plugin generates a `config.yml` file on first run with the following options
 
 ## Troubleshooting
 
+**Phantoms not spawning in the end:**
+- Check end_spawn_chance value in config.yml
+- It is low by default, increase it to your desire
+
 **Phantoms not attacking after being hit:**
 - Make sure you're using the latest version
 - Check server console for any error messages
