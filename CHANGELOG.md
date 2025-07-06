@@ -1,6 +1,31 @@
 # Changelog
 
+## [1.2.4] - 2025-01-27
+
+### Added
+- **Projectile Aggression**: Phantoms now become aggressive when hit by projectiles (arrows, tridents, snowballs, etc.) from players
+- Enhanced command feedback with colored messages
+- Permission system for the reload command
+- Better debug logging for projectile attacks
+
+### Fixed
+- Updated API version to 1.13 for better compatibility with Minecraft 1.13-1.21
+- Changed Java version from 17 to 8 for broader server compatibility
+- Fixed default debug logging setting (now defaults to false)
+- Improved command usage and help messages
+
+### Changed
+- Updated plugin description to mention projectile aggression
+- Enhanced configuration documentation
+- Better error handling for permission checks
+
 ## [1.2.3] - 2025-07-06
+
+### Fixed
+- Updated API version from 1.13 to 1.21 to match Spigot API dependency
+- Fixed version inconsistency in compile.bat (was 1.0.9, now 1.2.3)
+- Fixed typo in README ("natrually" → "naturally")
+- Updated compatibility information to show correct version range (1.13 - 1.21+)
 
 ### Changed
 - Default spawn control enabled (prevents Overworld spawning, enables End spawning)
@@ -108,5 +133,7 @@
 
 ## Planned Features
 
-- [ ] Commands to toggle plugin on/off
-- [ ] Add Projectile-aggression triggering 
+- [x] Commands to toggle plugin on/off
+- [x] Add Projectile-aggression triggering
+- [ ] Per-world configuration options
+- [ ] Phantom size customization
