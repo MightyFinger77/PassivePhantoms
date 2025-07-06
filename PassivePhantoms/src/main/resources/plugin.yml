@@ -1,7 +1,7 @@
 name: PassivePhantoms
 version: 1.2.3
 main: PassivePhantoms
-api-version: 1.13
+api-version: 1.21
 description: Makes phantoms passive until they are attacked by a player
 
 commands:
