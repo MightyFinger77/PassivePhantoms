@@ -7,6 +7,7 @@
 - Enhanced command feedback with colored messages
 - Permission system for the reload command
 - Better debug logging for projectile attacks
+- Better Config migration when updating version
 
 ### Fixed
 - Updated API version to 1.13 for better compatibility with Minecraft 1.13-1.21
