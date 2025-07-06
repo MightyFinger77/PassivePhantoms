@@ -16,8 +16,8 @@ import org.bukkit.Location;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.UUID;
 import java.util.Random;
 
@@ -25,22 +25,17 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
 
     private boolean debugLogging;
     private boolean passivePhantomsEnabled;
-    private int targetDelay;
-    private boolean permanentAggression;
     private boolean customSpawnControl;
     private double endSpawnChance;
     private Random random;
     
-    // Track aggressive phantoms and their targets
-    private Map<UUID, UUID> aggressivePhantoms = new HashMap<>();
+    // Simple set to track aggressive phantoms
+    private Set<UUID> aggressivePhantoms = new HashSet<>();
 
     @Override
     public void onEnable() {
         // Save default config if it doesn't exist
         saveDefaultConfig();
-        
-        // Update config with any new settings while preserving existing ones
-        updateConfig();
         
         // Load configuration
         loadConfig();
@@ -77,34 +72,26 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     private void loadConfig() {
         FileConfiguration config = getConfig();
         
-        debugLogging = config.getBoolean("debug_logging", false);
+        debugLogging = config.getBoolean("debug_logging", true);
         passivePhantomsEnabled = config.getBoolean("passive_phantoms_enabled", true);
-        targetDelay = config.getInt("phantom_settings.target_delay", 5);
-        permanentAggression = config.getBoolean("phantom_settings.permanent_aggression", true);
         customSpawnControl = config.getBoolean("phantom_settings.custom_spawn_control", true);
         endSpawnChance = config.getDouble("phantom_settings.end_spawn_chance", 0.05);
         random = new Random();
     }
 
-    @EventHandler(priority = EventPriority.HIGH)
+    @EventHandler(priority = EventPriority.LOWEST)
     public void onPhantomTarget(EntityTargetLivingEntityEvent event) {
         if (!passivePhantomsEnabled) return;
         if (!(event.getEntity() instanceof Phantom)) return;
         if (!(event.getTarget() instanceof Player)) return;
+        
         Phantom phantom = (Phantom) event.getEntity();
-        Player target = (Player) event.getTarget();
-        
-        // Check if this phantom is aggressive towards this specific player
         UUID phantomId = phantom.getUniqueId();
-        UUID targetId = target.getUniqueId();
         
-        if (aggressivePhantoms.containsKey(phantomId) && aggressivePhantoms.get(phantomId).equals(targetId)) {
-            // Phantom is aggressive towards this player, allow targeting
-            if (debugLogging) getLogger().info("Phantom targeting allowed - phantom is aggressive towards " + target.getName());
-        } else {
-            // Phantom is not aggressive towards this player, cancel targeting
+        // If phantom is not aggressive, cancel targeting
+        if (!aggressivePhantoms.contains(phantomId)) {
             event.setCancelled(true);
-            if (debugLogging) getLogger().info("Cancelled phantom targeting - phantom is passive towards " + target.getName());
+            if (debugLogging) getLogger().info("Cancelled targeting - phantom is passive");
         }
     }
 
@@ -113,34 +100,25 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         if (!passivePhantomsEnabled) return;
         if (!(event.getEntity() instanceof Phantom)) return;
         if (!(event.getDamager() instanceof Player)) return;
+        
         Phantom phantom = (Phantom) event.getEntity();
-        Player player = (Player) event.getDamager();
-        
         UUID phantomId = phantom.getUniqueId();
-        UUID playerId = player.getUniqueId();
         
-        // Make phantom aggressive towards the player who damaged it
-        if (!aggressivePhantoms.containsKey(phantomId) || !aggressivePhantoms.get(phantomId).equals(playerId)) {
-            aggressivePhantoms.put(phantomId, playerId);
-            if (debugLogging) getLogger().info("Phantom made aggressive towards " + player.getName());
-            // Set the target ONCE to trigger vanilla attack cycles
-            Bukkit.getScheduler().runTaskLater(this, () -> {
-                if (phantom.isValid() && !phantom.isDead() && player.isValid() && !player.isDead()) {
-                    phantom.setTarget(player);
-                    if (debugLogging) getLogger().info("Set target for aggressive phantom: " + player.getName());
-                }
-            }, 2L); // Small delay to let the damage event complete
-        }
+        // Make phantom aggressive
+        aggressivePhantoms.add(phantomId);
+        if (debugLogging) getLogger().info("Phantom made aggressive");
     }
 
     @EventHandler(priority = EventPriority.HIGH)
     public void onPhantomSpawn(EntitySpawnEvent event) {
         if (!passivePhantomsEnabled) return;
         if (!(event.getEntity() instanceof Phantom)) return;
-        Phantom phantom = (Phantom) event.getEntity();
         
-        // Remove any existing aggression tracking for this phantom
-        aggressivePhantoms.remove(phantom.getUniqueId());
+        Phantom phantom = (Phantom) event.getEntity();
+        UUID phantomId = phantom.getUniqueId();
+        
+        // Ensure phantom starts passive
+        aggressivePhantoms.remove(phantomId);
         
         if (debugLogging) getLogger().info("New phantom spawned - set to passive");
     }
@@ -198,52 +176,10 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     @EventHandler
     public void onPhantomDeath(org.bukkit.event.entity.EntityDeathEvent event) {
         if (event.getEntity() instanceof Phantom) {
-            aggressivePhantoms.remove(event.getEntity().getUniqueId());
-            if (debugLogging) getLogger().info("Phantom died - removed from aggression tracking");
+            UUID phantomId = event.getEntity().getUniqueId();
+            aggressivePhantoms.remove(phantomId);
+            if (debugLogging) getLogger().info("Phantom died - removed from tracking");
         }
-    }
-    
-    private void updateConfig() {
-        FileConfiguration config = getConfig();
-        FileConfiguration defaultConfig = getDefaultConfig();
-        boolean needsSave = false;
-        
-        // Check and add missing settings
-        if (!config.contains("phantom_settings.custom_spawn_control")) {
-            config.set("phantom_settings.custom_spawn_control", defaultConfig.getBoolean("phantom_settings.custom_spawn_control", true));
-            needsSave = true;
-            if (debugLogging) getLogger().info("Added missing config: phantom_settings.custom_spawn_control");
-        }
-        
-        if (!config.contains("phantom_settings.end_spawn_chance")) {
-            config.set("phantom_settings.end_spawn_chance", defaultConfig.getDouble("phantom_settings.end_spawn_chance", 0.05));
-            needsSave = true;
-            if (debugLogging) getLogger().info("Added missing config: phantom_settings.end_spawn_chance");
-        }
-        
-        // Save if any new settings were added
-        if (needsSave) {
-            try {
-                saveConfig();
-                getLogger().info("Config file updated with new settings!");
-            } catch (Exception e) {
-                getLogger().warning("Failed to save updated config: " + e.getMessage());
-            }
-        }
-    }
-    
-    private FileConfiguration getDefaultConfig() {
-        // Create a temporary config from the default resource
-        FileConfiguration defaultConfig = new org.bukkit.configuration.file.YamlConfiguration();
-        try {
-            java.io.InputStream inputStream = getResource("config.yml");
-            if (inputStream != null) {
-                defaultConfig.loadFromString(new String(inputStream.readAllBytes()));
-            }
-        } catch (Exception e) {
-            getLogger().warning("Failed to load default config: " + e.getMessage());
-        }
-        return defaultConfig;
     }
 
     @Override
@@ -252,7 +188,6 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
             if (args.length == 1 && args[0].equalsIgnoreCase("reload")) {
                 reloadConfig();
                 loadConfig();
-                updateConfig();
                 sender.sendMessage("PassivePhantoms configuration reloaded!");
                 return true;
             }
