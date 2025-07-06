@@ -3,6 +3,7 @@ import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Phantom;
 import org.bukkit.entity.Player;
+import org.bukkit.entity.Projectile;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
@@ -37,6 +38,9 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         // Save default config if it doesn't exist
         saveDefaultConfig();
         
+        // Migrate config to add any new settings
+        migrateConfig();
+        
         // Load configuration
         loadConfig();
         
@@ -69,10 +73,91 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         getLogger().info("PassivePhantoms plugin disabled!");
     }
 
+    private void migrateConfig() {
+        FileConfiguration config = getConfig();
+        boolean needsSave = false;
+        
+        // Check and add missing configuration options
+        if (!config.contains("debug_logging")) {
+            config.set("debug_logging", false);
+            needsSave = true;
+            if (debugLogging) getLogger().info("Added missing config option: debug_logging");
+        }
+        
+        if (!config.contains("passive_phantoms_enabled")) {
+            config.set("passive_phantoms_enabled", true);
+            needsSave = true;
+            if (debugLogging) getLogger().info("Added missing config option: passive_phantoms_enabled");
+        }
+        
+        if (!config.contains("phantom_settings.custom_spawn_control")) {
+            config.set("phantom_settings.custom_spawn_control", true);
+            needsSave = true;
+            if (debugLogging) getLogger().info("Added missing config option: phantom_settings.custom_spawn_control");
+        }
+        
+        if (!config.contains("phantom_settings.end_spawn_chance")) {
+            config.set("phantom_settings.end_spawn_chance", 0.05);
+            needsSave = true;
+            if (debugLogging) getLogger().info("Added missing config option: phantom_settings.end_spawn_chance");
+        }
+        
+        // Remove deprecated/old config options
+        if (config.contains("phantom_settings.target_delay")) {
+            config.set("phantom_settings.target_delay", null);
+            needsSave = true;
+            if (debugLogging) getLogger().info("Removed deprecated config option: phantom_settings.target_delay");
+        }
+        
+        if (config.contains("phantom_settings.permanent_aggression")) {
+            config.set("phantom_settings.permanent_aggression", null);
+            needsSave = true;
+            if (debugLogging) getLogger().info("Removed deprecated config option: phantom_settings.permanent_aggression");
+        }
+        
+        // Save config if changes were made
+        if (needsSave) {
+            saveConfig();
+            if (debugLogging) getLogger().info("Configuration migrated successfully");
+        }
+        
+        // Add behavior information comments if they don't exist
+        addBehaviorComments();
+    }
+    
+    private void addBehaviorComments() {
+        try {
+            java.io.File configFile = new java.io.File(getDataFolder(), "config.yml");
+            if (!configFile.exists()) return;
+            
+            java.nio.file.Path configPath = configFile.toPath();
+            String content = new String(java.nio.file.Files.readAllBytes(configPath));
+            
+            // Check if behavior comments already exist
+            if (content.contains("# Behavior Information:")) {
+                return; // Comments already exist
+            }
+            
+            // Add behavior comments at the end
+            String comments = "\n# Behavior Information:\n" +
+                            "# - Phantoms start passive and won't target players\n" +
+                            "# - Phantoms become aggressive when hit by players or projectiles (arrows, tridents, etc.)\n" +
+                            "# - Once aggressive, phantoms will target and attack players normally\n" +
+                            "# - Custom spawn control prevents phantoms from spawning in the Overworld\n" +
+                            "# - Phantoms can spawn in The End based on the configured chance";
+            
+            java.nio.file.Files.write(configPath, (content + comments).getBytes());
+            if (debugLogging) getLogger().info("Added behavior information comments to config file");
+            
+        } catch (Exception e) {
+            if (debugLogging) getLogger().warning("Could not add behavior comments to config: " + e.getMessage());
+        }
+    }
+
     private void loadConfig() {
         FileConfiguration config = getConfig();
         
-        debugLogging = config.getBoolean("debug_logging", true);
+        debugLogging = config.getBoolean("debug_logging", false);
         passivePhantomsEnabled = config.getBoolean("passive_phantoms_enabled", true);
         customSpawnControl = config.getBoolean("phantom_settings.custom_spawn_control", true);
         endSpawnChance = config.getDouble("phantom_settings.end_spawn_chance", 0.05);
@@ -99,14 +184,33 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     public void onPhantomDamaged(EntityDamageByEntityEvent event) {
         if (!passivePhantomsEnabled) return;
         if (!(event.getEntity() instanceof Phantom)) return;
-        if (!(event.getDamager() instanceof Player)) return;
+        
+        // Check if the damager is a player or a projectile shot by a player
+        Player damager = null;
+        
+        if (event.getDamager() instanceof Player) {
+            damager = (Player) event.getDamager();
+        } else if (event.getDamager() instanceof Projectile) {
+            Projectile projectile = (Projectile) event.getDamager();
+            if (projectile.getShooter() instanceof Player) {
+                damager = (Player) projectile.getShooter();
+            }
+        }
+        
+        if (damager == null) return;
         
         Phantom phantom = (Phantom) event.getEntity();
         UUID phantomId = phantom.getUniqueId();
         
         // Make phantom aggressive
         aggressivePhantoms.add(phantomId);
-        if (debugLogging) getLogger().info("Phantom made aggressive");
+        if (debugLogging) {
+            if (event.getDamager() instanceof Projectile) {
+                getLogger().info("Phantom made aggressive by projectile from " + damager.getName());
+            } else {
+                getLogger().info("Phantom made aggressive by direct attack from " + damager.getName());
+            }
+        }
     }
 
     @EventHandler(priority = EventPriority.HIGH)
@@ -186,9 +290,18 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (command.getName().equalsIgnoreCase("passivephantoms")) {
             if (args.length == 1 && args[0].equalsIgnoreCase("reload")) {
+                if (!sender.hasPermission("passivephantoms.reload")) {
+                    sender.sendMessage("§cYou don't have permission to use this command!");
+                    return true;
+                }
                 reloadConfig();
+                migrateConfig(); // Run migration again after reload
                 loadConfig();
-                sender.sendMessage("PassivePhantoms configuration reloaded!");
+                sender.sendMessage("§aPassivePhantoms configuration reloaded!");
+                return true;
+            } else if (args.length == 0) {
+                sender.sendMessage("§6PassivePhantoms v" + getDescription().getVersion());
+                sender.sendMessage("§7Use §f/passivephantoms reload §7to reload the configuration");
                 return true;
             }
         }
