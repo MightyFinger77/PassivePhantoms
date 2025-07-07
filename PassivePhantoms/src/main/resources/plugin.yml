@@ -2,7 +2,8 @@ name: PassivePhantoms
 version: 1.2.5
 main: PassivePhantoms
 api-version: 1.13
-description: Makes phantoms passive until they are attacked by a player or projectile
+description: Makes phantoms passive until they are attacked by a player or projectile. Features per-chunk mobcap and movement improvements to prevent phantoms from getting stuck.
+# Note: Movement improvements are experimental and phantoms may still get hung up on chorus trees.
 
 commands:
   passivephantoms:
