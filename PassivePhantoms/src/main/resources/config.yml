@@ -16,7 +16,7 @@ phantom_settings:
   # 0.01 = 1% chance every 10 seconds (rare)
   # 0.05 = 5% chance every 10 seconds (moderate)
   # 0.1 = 10% chance every 10 seconds (frequent)
-  # 0.2 = 20% chance every 10 seconds (very frequent)
+  # 0.2 = 20% chance every 10 seconds (very frequent) - WARNING: Values above 0.2 are only recommended for testing as they can cause excessive phantom spawning (use with caution)
   end_spawn_chance: 0.05
 
 # Behavior Information:
