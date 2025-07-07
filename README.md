@@ -13,8 +13,8 @@ A Minecraft Bukkit/Spigot plugin that makes phantoms spawn naturally in the end 
 
 ## Installation
 
-1. **Download**: Get the latest JAR file from the releases (v1.2.4)
-2. **Install**: Place `PassivePhantoms-1.2.4.jar` in your server's `plugins/` folder
+1. **Download**: Get the latest JAR file from the releases (v1.2.5)
+2. **Install**: Place `PassivePhantoms-1.2.5.jar` in your server's `plugins/` folder
 3. **Restart**: Restart your server
 4. **Verify**: Check the console for "PassivePhantoms plugin enabled!" message
 
@@ -31,6 +31,9 @@ The plugin generates a `config.yml` file on first run with the following options
 
 - `/passivephantoms` - Shows plugin version and usage
 - `/passivephantoms reload` - Reloads the configuration
+- `/passivephantoms debug` - Toggle debug logging
+- `/passivephantoms status` - Check plugin status
+- `/passivephantoms list` - List aggressive phantoms
 
 ## Permissions
 
@@ -55,10 +58,6 @@ The plugin generates a `config.yml` file on first run with the following options
 
 ## Troubleshooting
 
-**Phantoms not spawning in the end:**
-- Check end_spawn_chance value in config.yml
-- It is low by default, increase it to your desire
-
 **Phantoms not attacking after being hit:**
 - Make sure you're using the latest version
 - Check server console for any error messages
@@ -70,7 +69,7 @@ The plugin generates a `config.yml` file on first run with the following options
 - Verify your server version is compatible
 
 **Projectiles not making phantoms aggressive:**
-- Ensure you're using version 1.2.4 or higher
+- Ensure you're using version 1.2.5 or higher
 - Check that the projectile was shot by a player
 - Verify debug logging is enabled to see detailed messages
 
