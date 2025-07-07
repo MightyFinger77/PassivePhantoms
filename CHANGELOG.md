@@ -1,13 +1,44 @@
 # Changelog
 
+## [1.2.5] - 2025-01-27
+
+### Fixed
+- **CRITICAL**: Fixed phantom targeting issue where Phantom aggresion would randomly break
+- **CRITICAL**: Fixed phantom aggression persistence - phantoms now stay aggressive after being hit
+- Changed event priority from LOWEST to HIGH for better compatibility with other plugins
+- Improved phantom damage event handling to ensure immediate aggression
+- Fixed targeting logic to properly handle null targets for aggressive phantoms
+- Added immediate re-targeting for aggressive phantoms when they lose their target
+- Fixed variable scoping issues in lambda expressions
+
+### Added
+- New `/passivephantoms debug` command to toggle debug logging in-game
+- New `/passivephantoms status` command to check plugin status and aggressive phantom count
+- New `/passivephantoms list` command to list all aggressive phantoms and their current targets
+- Enhanced debug logging with phantom UUIDs for better troubleshooting
+- **Tab completion** for all `/passivephantoms` commands with smart filtering
+- Comprehensive tracking of when phantoms are added/removed from aggressive set
+
+### Changed
+- Updated version to 1.2.5 to reflect critical bug fixes
+- Improved command help messages with new subcommands
+- Enhanced targeting event logging to show target information and aggressive status
+- Better error handling and safety checks for phantom targeting
+
+### Technical Details
+- Aggressive phantoms now re-target immediately when they lose their target (null)
+- Re-targeting uses next-tick scheduling to avoid event conflicts
+- Only re-targets when phantom actually loses target, not constantly
+- Preserves natural phantom AI attack cycles while maintaining aggression
+
 ## [1.2.4] - 2025-01-27
 
 ### Added
-- **Projectile Aggression**: Phantoms now become aggressive when hit by projectiles (arrows, tridents, snowballs, etc.) from players
-- Enhanced command feedback with colored messages
-- Permission system for the reload command
-- Better debug logging for projectile attacks
-- Better Config migration when updating version
+-Projectile Aggression: Phantoms now become aggressive when hit by projectiles (arrows, tridents, snowballs, etc.) from players
+-Enhanced command feedback with colored messages
+-Permission system for the reload command
+-Better debug logging for projectile attacks
+-Better Config migration when updating version
 
 ### Fixed
 - Updated API version to 1.13 for better compatibility with Minecraft 1.13-1.21
