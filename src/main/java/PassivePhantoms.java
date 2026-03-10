@@ -20,22 +20,53 @@ import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.event.player.PlayerJoinEvent;
+
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.IOException;
+import java.io.Reader;
+import java.io.StringWriter;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.io.File;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
 import java.util.Random;
+import java.util.Collection;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Stack;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.logging.Level;
+import java.util.Locale;
 
 public class PassivePhantoms extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
+
+    /** Config version in default config.yml; bump when adding/removing options so user config is merged. */
+    private static final int CONFIG_VERSION = 2;
+    /** Modrinth API v2: GET /project/{id|slug}/version returns JSON array; first item has version_number. */
+    private static final String MODRINTH_VERSION_URL = "https://api.modrinth.com/v2/project/%s/version";
+    private static final String MODRINTH_PROJECT_ID = "passivephantoms";
 
     private boolean debugLogging;
     private boolean passivePhantomsEnabled;
     private boolean customSpawnControl;
     private double endSpawnChance;
     private int maxPhantomsPerChunk;
+    /** Radius (blocks) around player to count phantoms for cap; prevents flying phantoms from bypassing by leaving chunk. */
+    private double spawnCheckRadius;
+    /** Ticks between spawn rolls in The End (200 = 10 seconds). Only applied on reload/restart. */
+    private long endSpawnIntervalTicks;
     private Random random;
     
     // Simple set to track aggressive phantoms
@@ -57,6 +88,11 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     private boolean treeAvoidanceEnabled;
     private double treeAvoidanceRadius;
     
+    // Modrinth update checker
+    private boolean updateCheckerEnabled;
+    private volatile String latestVersion;
+    private volatile boolean updateAvailable = false;
+    
     // Helper method to add phantom to aggressive set with logging
     private void addAggressivePhantom(UUID phantomId, String reason) {
         if (aggressivePhantoms.add(phantomId)) {
@@ -75,16 +111,25 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         }
     }
     
-    // Helper method to count phantoms in a specific chunk
+    /** Count phantoms in one chunk. Uses getNearbyEntities for the chunk column to avoid iterating the whole world. */
     private int countPhantomsInChunk(World world, int chunkX, int chunkZ) {
+        Location chunkCenter = new Location(world, (chunkX << 4) + 8, 64, (chunkZ << 4) + 8);
+        Collection<Entity> inChunk = world.getNearbyEntities(chunkCenter, 8, 128, 8);
         int count = 0;
-        for (Entity entity : world.getEntities()) {
-            if (entity instanceof Phantom) {
-                Location loc = entity.getLocation();
-                if (loc.getBlockX() >> 4 == chunkX && loc.getBlockZ() >> 4 == chunkZ) {
-                    count++;
-                }
-            }
+        for (Entity entity : inChunk) {
+            if (entity instanceof Phantom) count++;
+        }
+        return count;
+    }
+    
+    /** Count phantoms within radius of a location. Uses getNearbyEntities so we only scan a box, not the whole world. */
+    private int countPhantomsNear(World world, Location center, double radiusBlocks) {
+        if (center == null || world == null) return 0;
+        double radiusSq = radiusBlocks * radiusBlocks;
+        Collection<Entity> nearby = world.getNearbyEntities(center, radiusBlocks, radiusBlocks, radiusBlocks);
+        int count = 0;
+        for (Entity entity : nearby) {
+            if (entity instanceof Phantom && center.distanceSquared(entity.getLocation()) <= radiusSq) count++;
         }
         return count;
     }
@@ -286,12 +331,11 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         
         Location nearest = null;
         double nearestDistance = Double.MAX_VALUE;
-        
+        int radiusSquared = radius * radius;
         for (int x = -radius; x <= radius; x++) {
             for (int y = -radius; y <= radius; y++) {
                 for (int z = -radius; z <= radius; z++) {
-                    // Skip if outside the sphere (performance optimization)
-                    if (x * x + y * y + z * z > radius * radius) continue;
+                    if (x * x + y * y + z * z > radiusSquared) continue;
                     
                     Block block = world.getBlockAt(
                         location.getBlockX() + x,
@@ -315,48 +359,75 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         return nearest;
     }
     
-    // Optimized method to monitor phantom movement, stuck detection, and tree avoidance
+    /** Radius (blocks) within which phantoms are considered "near a player" for stuck/tree logic. Saves work for distant phantoms. */
+    private static final double MOVEMENT_MONITOR_PLAYER_RADIUS = 128.0;
+    
+    private boolean isNearAnyPlayer(Location phantomLoc, List<Location> playerLocations) {
+        if (phantomLoc == null || playerLocations.isEmpty()) return false;
+        double radiusSq = MOVEMENT_MONITOR_PLAYER_RADIUS * MOVEMENT_MONITOR_PLAYER_RADIUS;
+        for (Location playerLoc : playerLocations) {
+            if (playerLoc != null && playerLoc.getWorld() == phantomLoc.getWorld()
+                    && phantomLoc.distanceSquared(playerLoc) <= radiusSq) return true;
+        }
+        return false;
+    }
+    
+    // Optimized method to monitor phantom movement, stuck detection, and tree avoidance, stuck detection, and tree avoidance
     private void monitorPhantomMovement() {
         if (!movementImprovementsEnabled) return;
         
-        // Cache current time for performance
         long currentTime = System.currentTimeMillis();
         
         for (World world : Bukkit.getWorlds()) {
             if (world.getEnvironment() != World.Environment.THE_END) continue;
             
-            // Get all entities once and filter efficiently
-            List<Entity> entities = world.getEntities();
-            if (entities.isEmpty()) continue;
+            List<Player> players = world.getPlayers();
+            if (players.isEmpty()) continue;
             
+            // Only process phantoms near at least one player (stuck/tree logic is irrelevant far away)
+            List<Location> playerLocations = new ArrayList<>(players.size());
+            for (Player p : players) {
+                if (p.isValid() && !p.isDead()) playerLocations.add(p.getLocation());
+            }
+            if (playerLocations.isEmpty()) continue;
+            
+            Collection<Entity> entities = world.getEntities();
             for (Entity entity : entities) {
                 if (!(entity instanceof Phantom)) continue;
                 
                 Phantom phantom = (Phantom) entity;
                 UUID phantomId = phantom.getUniqueId();
                 
-                // Skip if phantom is dead or invalid (early return for performance)
                 if (!phantom.isValid() || phantom.isDead()) {
                     cleanupPhantomData(phantomId);
                     continue;
                 }
                 
                 Location currentLoc = phantom.getLocation();
+                if (!isNearAnyPlayer(currentLoc, playerLocations)) continue;
                 
-                // Handle stuck detection
                 handleStuckDetection(phantom, phantomId, currentLoc, currentTime);
                 
-                // Handle tree avoidance (only if enabled and phantom is near trees, with cooldown)
                 if (treeAvoidanceEnabled && isNearChorusFruit(currentLoc)) {
                     long lastAvoidance = lastTreeAvoidanceTime.getOrDefault(phantomId, 0L);
-                    if (currentTime - lastAvoidance > 2000) { // 2 second cooldown
+                    if (currentTime - lastAvoidance > 2000) {
                         guidePhantomAroundTrees(phantom);
                         lastTreeAvoidanceTime.put(phantomId, currentTime);
                     }
                 }
                 
-                // Update last location
                 lastPhantomLocations.put(phantomId, currentLoc);
+            }
+        }
+        // Prune stale UUIDs from aggressive set (phantoms removed without EntityDeathEvent)
+        if (!aggressivePhantoms.isEmpty()) {
+            List<UUID> toRemove = new ArrayList<>();
+            for (UUID uuid : aggressivePhantoms) {
+                if (Bukkit.getEntity(uuid) == null) toRemove.add(uuid);
+            }
+            for (UUID uuid : toRemove) {
+                aggressivePhantoms.remove(uuid);
+                cleanupPhantomData(uuid);
             }
         }
     }
@@ -423,9 +494,8 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         
         // Start custom phantom spawning in The End if enabled
         if (passivePhantomsEnabled && customSpawnControl) {
-            Bukkit.getScheduler().runTaskTimer(this, () -> {
-                spawnPhantomsInEnd();
-            }, 200L, 200L); // Check every 10 seconds (200 ticks)
+            long interval = endSpawnIntervalTicks;
+            Bukkit.getScheduler().runTaskTimer(this, this::spawnPhantomsInEnd, interval, interval);
         }
         
         // Start optimized movement monitoring if enabled
@@ -435,6 +505,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
             }, stuckDetectionTicks, stuckDetectionTicks);
         }
         
+        runUpdateCheckAsync();
         getLogger().info("PassivePhantoms plugin enabled!");
         if (debugLogging) {
             getLogger().info("Debug logging: ENABLED");
@@ -448,143 +519,333 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
 
     @Override
     public void onDisable() {
+        aggressivePhantoms.clear();
+        lastPhantomLocations.clear();
+        stuckCounter.clear();
+        lastMovementTime.clear();
+        stuckAttempts.clear();
+        lastTreeAvoidanceTime.clear();
         getLogger().info("PassivePhantoms plugin disabled!");
     }
-
-    private void migrateConfig() {
-        FileConfiguration config = getConfig();
-        boolean needsSave = false;
-        
-        // Check and add missing configuration options
-        if (!config.contains("debug_logging")) {
-            config.set("debug_logging", false);
-            needsSave = true;
-            if (debugLogging) getLogger().info("Added missing config option: debug_logging");
-        }
-        
-        if (!config.contains("passive_phantoms_enabled")) {
-            config.set("passive_phantoms_enabled", true);
-            needsSave = true;
-            if (debugLogging) getLogger().info("Added missing config option: passive_phantoms_enabled");
-        }
-        
-        if (!config.contains("phantom_settings.custom_spawn_control")) {
-            config.set("phantom_settings.custom_spawn_control", true);
-            needsSave = true;
-            if (debugLogging) getLogger().info("Added missing config option: phantom_settings.custom_spawn_control");
-        }
-        
-        if (!config.contains("phantom_settings.end_spawn_chance")) {
-            config.set("phantom_settings.end_spawn_chance", 0.05);
-            needsSave = true;
-            if (debugLogging) getLogger().info("Added missing config option: phantom_settings.end_spawn_chance");
-        }
-        
-        if (!config.contains("phantom_settings.max_phantoms_per_chunk")) {
-            config.set("phantom_settings.max_phantoms_per_chunk", 8);
-            needsSave = true;
-            if (debugLogging) getLogger().info("Added missing config option: phantom_settings.max_phantoms_per_chunk");
-        }
-        
-        // Add movement improvement settings
-        if (!config.contains("phantom_settings.movement_improvements_enabled")) {
-            config.set("phantom_settings.movement_improvements_enabled", true);
-            needsSave = true;
-            if (debugLogging) getLogger().info("Added missing config option: phantom_settings.movement_improvements_enabled");
-        }
-        
-        if (!config.contains("phantom_settings.stuck_detection_ticks")) {
-            config.set("phantom_settings.stuck_detection_ticks", 100);
-            needsSave = true;
-            if (debugLogging) getLogger().info("Added missing config option: phantom_settings.stuck_detection_ticks");
-        }
-        
-        if (!config.contains("phantom_settings.stuck_threshold")) {
-            config.set("phantom_settings.stuck_threshold", 3);
-            needsSave = true;
-            if (debugLogging) getLogger().info("Added missing config option: phantom_settings.stuck_threshold");
-        }
-        
-        if (!config.contains("phantom_settings.stuck_distance_threshold")) {
-            config.set("phantom_settings.stuck_distance_threshold", 1.0);
-            needsSave = true;
-            if (debugLogging) getLogger().info("Added missing config option: phantom_settings.stuck_distance_threshold");
-        }
-        
-        if (!config.contains("phantom_settings.max_stuck_attempts")) {
-            config.set("phantom_settings.max_stuck_attempts", 5);
-            needsSave = true;
-            if (debugLogging) getLogger().info("Added missing config option: phantom_settings.max_stuck_attempts");
-        }
-        
-        // Add tree avoidance settings
-        if (!config.contains("phantom_settings.tree_avoidance_enabled")) {
-            config.set("phantom_settings.tree_avoidance_enabled", true);
-            needsSave = true;
-            if (debugLogging) getLogger().info("Added missing config option: phantom_settings.tree_avoidance_enabled");
-        }
-        
-        if (!config.contains("phantom_settings.tree_avoidance_radius")) {
-            config.set("phantom_settings.tree_avoidance_radius", 3.0);
-            needsSave = true;
-            if (debugLogging) getLogger().info("Added missing config option: phantom_settings.tree_avoidance_radius");
-        }
-        
-
-        
-
-        
-        // Remove deprecated/old config options
-        if (config.contains("phantom_settings.target_delay")) {
-            config.set("phantom_settings.target_delay", null);
-            needsSave = true;
-            if (debugLogging) getLogger().info("Removed deprecated config option: phantom_settings.target_delay");
-        }
-        
-        if (config.contains("phantom_settings.permanent_aggression")) {
-            config.set("phantom_settings.permanent_aggression", null);
-            needsSave = true;
-            if (debugLogging) getLogger().info("Removed deprecated config option: phantom_settings.permanent_aggression");
-        }
-        
-        // Save config if changes were made
-        if (needsSave) {
-            saveConfig();
-            if (debugLogging) getLogger().info("Configuration migrated successfully");
-        }
-        
-        // Add behavior information comments if they don't exist
-        addBehaviorComments();
+    
+    /** Modrinth update check (async); notifies console and players with permission on join. */
+    private void runUpdateCheckAsync() {
+        if (!updateCheckerEnabled) return;
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                HttpURLConnection conn = (HttpURLConnection) URI.create(String.format(MODRINTH_VERSION_URL, MODRINTH_PROJECT_ID)).toURL().openConnection();
+                conn.setRequestMethod("GET");
+                conn.setConnectTimeout(5000);
+                conn.setReadTimeout(5000);
+                conn.setRequestProperty("User-Agent", "PassivePhantoms/" + getDescription().getVersion() + " (MightyFinger77)");
+                if (conn.getResponseCode() != 200) {
+                    conn.disconnect();
+                    return;
+                }
+                String body = readFully(conn.getInputStream());
+                conn.disconnect();
+                String fetchedVersion = parseModrinthVersionNumber(body);
+                if (fetchedVersion == null || fetchedVersion.isEmpty()) return;
+                String currentVersion = getDescription().getVersion();
+                final String latest = fetchedVersion.trim();
+                final boolean newer = isNewerVersion(latest, currentVersion);
+                Bukkit.getScheduler().runTask(this, () -> {
+                    latestVersion = latest;
+                    updateAvailable = newer;
+                    if (newer) {
+                        getLogger().info("[PassivePhantoms] Update available: " + latest + " (current: " + currentVersion + ")");
+                        getLogger().info("[PassivePhantoms] Download: https://modrinth.com/plugin/" + MODRINTH_PROJECT_ID);
+                    }
+                });
+            } catch (Exception ignored) { }
+        });
     }
     
-    private void addBehaviorComments() {
-        try {
-            java.io.File configFile = new java.io.File(getDataFolder(), "config.yml");
-            if (!configFile.exists()) return;
-            
-            java.nio.file.Path configPath = configFile.toPath();
-            String content = new String(java.nio.file.Files.readAllBytes(configPath));
-            
-            // Check if behavior comments already exist
-            if (content.contains("# Behavior Information:")) {
-                return; // Comments already exist
-            }
-            
-            // Add behavior comments at the end
-            String comments = "\n# Behavior Information:\n" +
-                            "# - Phantoms start passive and won't target players\n" +
-                            "# - Phantoms become aggressive when hit by players or projectiles (arrows, tridents, etc.)\n" +
-                            "# - Once aggressive, phantoms will target and attack players normally\n" +
-                            "# - Custom spawn control prevents phantoms from spawning in the Overworld\n" +
-                            "# - Phantoms can spawn in The End based on the configured chance\n" +
-                            "# - Movement improvements help phantoms avoid getting stuck and fly around chorus fruit trees naturally";
-            
-            java.nio.file.Files.write(configPath, (content + comments).getBytes());
-            if (debugLogging) getLogger().info("Added behavior information comments to config file");
-            
-        } catch (Exception e) {
-            if (debugLogging) getLogger().warning("Could not add behavior comments to config: " + e.getMessage());
+    private static String parseModrinthVersionNumber(String json) {
+        if (json == null) return null;
+        int keyIdx = json.indexOf("\"version_number\"");
+        if (keyIdx == -1) return null;
+        int colon = json.indexOf(':', keyIdx);
+        if (colon == -1) return null;
+        int start = json.indexOf('"', colon + 1);
+        if (start == -1) return null;
+        start++;
+        int end = json.indexOf('"', start);
+        if (end == -1) return null;
+        return json.substring(start, end).trim();
+    }
+    
+    private static String readFully(java.io.InputStream in) throws IOException {
+        try (Reader r = new InputStreamReader(in, StandardCharsets.UTF_8); StringWriter w = new StringWriter()) {
+            char[] buf = new char[512];
+            int n;
+            while ((n = r.read(buf)) != -1) w.write(buf, 0, n);
+            return w.toString();
         }
+    }
+    
+    /**
+     * Version comparison that supports dev/pre-release suffixes (e.g. 1.2.6b1, 1.2.6-Dev1a, 1.2.6-dev2).
+     * Release is newer than dev of same base; dev vs dev compared by suffix number then letter.
+     */
+    private boolean isNewerVersion(String latest, String current) {
+        if (latest == null || current == null) return false;
+        String cleanLatest = latest.trim().replaceAll("^(v|version|alpha|beta|release)\\s*", "").trim();
+        String cleanCurrent = current.trim().replaceAll("^(v|version|alpha|beta|release)\\s*", "").trim();
+        cleanLatest = cleanLatest.replaceAll("^(Alpha|Beta|Release|V|Version)\\s*", "").trim();
+        cleanCurrent = cleanCurrent.replaceAll("^(Alpha|Beta|Release|V|Version)\\s*", "").trim();
+        boolean latestIsDev = isDevVersion(cleanLatest);
+        boolean currentIsDev = isDevVersion(cleanCurrent);
+        String baseLatest = stripDevSuffix(cleanLatest);
+        String baseCurrent = stripDevSuffix(cleanCurrent);
+        try {
+            String[] latestParts = baseLatest.split("\\.");
+            String[] currentParts = baseCurrent.split("\\.");
+            int maxLen = Math.max(latestParts.length, currentParts.length);
+            for (int i = 0; i < maxLen; i++) {
+                int l = i < latestParts.length ? parseIntSafe(latestParts[i].replaceAll("[^0-9].*$", ""), 0) : 0;
+                int c = i < currentParts.length ? parseIntSafe(currentParts[i].replaceAll("[^0-9].*$", ""), 0) : 0;
+                if (l > c) return true;
+                if (l < c) return false;
+            }
+            if (baseLatest.equals(baseCurrent)) {
+                if (!latestIsDev && currentIsDev) return true;
+                if (latestIsDev && currentIsDev) {
+                    int latestNum = extractDevSuffixNumber(cleanLatest);
+                    int currentNum = extractDevSuffixNumber(cleanCurrent);
+                    if (latestNum != currentNum) return latestNum > currentNum;
+                    char latestLetter = extractDevSuffixLetter(cleanLatest);
+                    char currentLetter = extractDevSuffixLetter(cleanCurrent);
+                    return latestLetter > currentLetter;
+                }
+                return false;
+            }
+            return false;
+        } catch (Exception e) {
+            return !baseLatest.equals(baseCurrent);
+        }
+    }
+    
+    private static boolean isDevVersion(String version) {
+        if (version == null) return false;
+        return version.matches(".*[-_](?i)(dev|snapshot|alpha|beta|rc|build|pre)[\\d\\w]*$")
+                || version.matches(".*\\d+[a-zA-Z][\\d]*$");
+    }
+    
+    private static String stripDevSuffix(String version) {
+        if (version == null) return "";
+        return version.replaceAll("[-_](?i)(dev|snapshot|alpha|beta|rc|build|pre)[\\d\\w]*$", "")
+                .replaceAll("(\\d+)[a-zA-Z][\\d]*$", "$1").trim();
+    }
+    
+    /** Matches -dev2, b2, beta3 (group 1) or trailing letter+digits like b1 in 6b1 (group 2). */
+    private static final Pattern DEV_SUFFIX_NUMBER = Pattern.compile("(?i)(?:dev|b|beta|alpha|rc)[-_]?(\\d+)|[a-zA-Z](\\d+)$");
+    /** Matches -Dev1a / -dev2a (group 1) or trailing 6b1 -> letter b (group 2). Letter is case-insensitive. */
+    private static final Pattern DEV_SUFFIX_LETTER = Pattern.compile("(?i)[-_]?dev\\d+([a-zA-Z])$|\\d+([a-zA-Z])[\\d]*$");
+    
+    private static int extractDevSuffixNumber(String version) {
+        if (version == null) return 0;
+        Matcher m = DEV_SUFFIX_NUMBER.matcher(version);
+        if (m.find()) {
+            for (int i = 1; i <= m.groupCount(); i++) {
+                String g = m.group(i);
+                if (g != null && !g.isEmpty()) return parseIntSafe(g, 0);
+            }
+        }
+        return 0;
+    }
+    
+    private static char extractDevSuffixLetter(String version) {
+        if (version == null) return 'a';
+        Matcher m = DEV_SUFFIX_LETTER.matcher(version);
+        if (m.find()) {
+            for (int i = 1; i <= m.groupCount(); i++) {
+                String g = m.group(i);
+                if (g != null && !g.isEmpty()) return g.toLowerCase(Locale.ROOT).charAt(0);
+            }
+        }
+        return 'a';
+    }
+    
+    private static int parseIntSafe(String s, int def) {
+        try { return Integer.parseInt(s); } catch (NumberFormatException e) { return def; }
+    }
+
+    /**
+     * Locktight-style config migration: merge default config (comments/formatting) with user values.
+     * Preserves comments and adds missing keys without wiping user settings.
+     */
+    private void migrateConfig() {
+        File configFile = new File(getDataFolder(), "config.yml");
+        if (!configFile.exists()) return;
+        try {
+            InputStream defaultStream = getResource("config.yml");
+            if (defaultStream == null) return;
+            List<String> defaultLines = new ArrayList<>();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(defaultStream, StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) defaultLines.add(line);
+            }
+            InputStream defaultYamlStream = getResource("config.yml");
+            if (defaultYamlStream == null) return;
+            YamlConfiguration defaultConfig = YamlConfiguration.loadConfiguration(new InputStreamReader(defaultYamlStream, StandardCharsets.UTF_8));
+            YamlConfiguration currentConfig = YamlConfiguration.loadConfiguration(configFile);
+            int defaultVersion = defaultConfig.getInt("config_version", 1);
+            int currentVersion = currentConfig.getInt("config_version", 0);
+            if (currentVersion >= defaultVersion && currentConfig.contains("config_version")) return;
+            getLogger().info("Config migration: current version=" + currentVersion + ", default version=" + defaultVersion);
+            List<String> mergedLines = mergeConfigs(defaultLines, currentConfig, defaultConfig);
+            Set<String> deprecatedKeys = findDeprecatedKeys(currentConfig, defaultConfig);
+            if (!deprecatedKeys.isEmpty() && debugLogging) getLogger().info("Removed deprecated config keys: " + String.join(", ", deprecatedKeys));
+            updateConfigVersion(mergedLines, defaultVersion, defaultLines, "config_version");
+            Files.write(configFile.toPath(), mergedLines, StandardCharsets.UTF_8);
+            getLogger().info("Config migration completed - merged with default config, preserving user values and comments");
+            reloadConfig();
+        } catch (Exception e) {
+            getLogger().log(Level.WARNING, "Error during config migration: " + e.getMessage(), e);
+        }
+    }
+    
+    private List<String> mergeConfigs(List<String> defaultLines, YamlConfiguration userConfig, YamlConfiguration defaultConfig) {
+        List<String> merged = new ArrayList<>();
+        Stack<Pair<String, Integer>> pathStack = new Stack<>();
+        for (int i = 0; i < defaultLines.size(); i++) {
+            String line = defaultLines.get(i);
+            String trimmed = line.trim();
+            int currentIndent = line.length() - trimmed.length();
+            if (trimmed.isEmpty() || line.startsWith("#")) {
+                merged.add(line);
+                continue;
+            }
+            while (!pathStack.isEmpty() && currentIndent <= pathStack.peek().value) pathStack.pop();
+            if (trimmed.startsWith("-")) {
+                merged.add(line);
+                continue;
+            }
+            if (trimmed.contains(":") && !trimmed.startsWith("#")) {
+                int colonIndex = trimmed.indexOf(':');
+                String keyPart = trimmed.substring(0, colonIndex).trim();
+                String valuePart = trimmed.substring(colonIndex + 1).trim();
+                StringBuilder fullPathBuilder = new StringBuilder();
+                for (Pair<String, Integer> p : pathStack) {
+                    if (fullPathBuilder.length() > 0) fullPathBuilder.append(".");
+                    fullPathBuilder.append(p.key);
+                }
+                if (fullPathBuilder.length() > 0) fullPathBuilder.append(".");
+                fullPathBuilder.append(keyPart);
+                String fullPath = fullPathBuilder.toString();
+                boolean isSection = valuePart.isEmpty();
+                if (isSection && i + 1 < defaultLines.size()) {
+                    for (int j = i + 1; j < defaultLines.size() && j < i + 10; j++) {
+                        String nextLine = defaultLines.get(j);
+                        String nextTrimmed = nextLine.trim();
+                        if (nextTrimmed.isEmpty() || nextLine.startsWith("#")) continue;
+                        int nextIndent = nextLine.length() - nextTrimmed.length();
+                        if (nextTrimmed.startsWith("-") || nextIndent > currentIndent) {
+                            isSection = true;
+                            break;
+                        } else break;
+                    }
+                }
+                if (isSection) {
+                    merged.add(line);
+                    pathStack.push(new Pair<>(keyPart, currentIndent));
+                } else {
+                    if (keyPart.equals("config_version")) {
+                        merged.add(line);
+                    } else if (userConfig.contains(fullPath)) {
+                        Object userValue = userConfig.get(fullPath);
+                        String userValueStr = formatYamlValue(userValue);
+                        int commentIndex = valuePart.indexOf('#');
+                        String inlineComment = commentIndex >= 0 ? " " + valuePart.substring(commentIndex) : "";
+                        merged.add(" ".repeat(currentIndent) + keyPart + ": " + userValueStr + inlineComment);
+                    } else {
+                        merged.add(line);
+                    }
+                }
+            } else {
+                merged.add(line);
+            }
+        }
+        return merged;
+    }
+    
+    private Set<String> findDeprecatedKeys(YamlConfiguration userConfig, YamlConfiguration defaultConfig) {
+        Set<String> deprecated = new HashSet<>();
+        findDeprecatedKeysRecursive(userConfig, defaultConfig, "", deprecated);
+        return deprecated;
+    }
+    
+    private void findDeprecatedKeysRecursive(YamlConfiguration userConfig, YamlConfiguration defaultConfig, String basePath, Set<String> deprecated) {
+        for (String key : userConfig.getKeys(false)) {
+            String fullPath = basePath.isEmpty() ? key : basePath + "." + key;
+            if (key.equals("config_version")) continue;
+            if (!defaultConfig.contains(fullPath)) deprecated.add(fullPath);
+            else if (userConfig.isConfigurationSection(key) && defaultConfig.isConfigurationSection(fullPath)) {
+                findDeprecatedKeysRecursive(userConfig.getConfigurationSection(key), defaultConfig.getConfigurationSection(fullPath), fullPath, deprecated);
+            }
+        }
+    }
+    
+    private void findDeprecatedKeysRecursive(ConfigurationSection userSection, ConfigurationSection defaultSection, String basePath, Set<String> deprecated) {
+        for (String key : userSection.getKeys(false)) {
+            String fullPath = basePath.isEmpty() ? key : basePath + "." + key;
+            if (key.equals("config_version")) continue;
+            if (!defaultSection.contains(key)) deprecated.add(fullPath);
+            else if (userSection.isConfigurationSection(key) && defaultSection.isConfigurationSection(key)) {
+                findDeprecatedKeysRecursive(userSection.getConfigurationSection(key), defaultSection.getConfigurationSection(key), fullPath, deprecated);
+            }
+        }
+    }
+    
+    private static final class Pair<K, V> {
+        final K key;
+        final V value;
+        Pair(K key, V value) { this.key = key; this.value = value; }
+    }
+    
+    private String formatYamlValue(Object value) {
+        if (value == null) return "null";
+        if (value instanceof String) {
+            String str = (String) value;
+            if (str.contains(":") || str.contains("#") || str.trim().isEmpty() || str.equalsIgnoreCase("true") || str.equalsIgnoreCase("false") || str.equalsIgnoreCase("null") || str.matches("^-?\\d+$"))
+                return "\"" + str.replace("\"", "\\\"") + "\"";
+            return str;
+        }
+        if (value instanceof Boolean || value instanceof Number) return value.toString();
+        return value.toString();
+    }
+    
+    private void updateConfigVersion(List<String> lines, int newVersion, List<String> defaultLines, String versionKey) {
+        for (int i = 0; i < lines.size(); i++) {
+            String line = lines.get(i);
+            String trimmed = line.trim();
+            if (trimmed.startsWith(versionKey + ":") || trimmed.startsWith(versionKey + " ")) {
+                int indent = line.length() - trimmed.length();
+                String restOfLine = "";
+                int colonIndex = trimmed.indexOf(':');
+                if (colonIndex >= 0 && colonIndex + 1 < trimmed.length()) {
+                    String afterColon = trimmed.substring(colonIndex + 1).trim();
+                    int commentIndex = afterColon.indexOf('#');
+                    if (commentIndex >= 0) restOfLine = " #" + afterColon.substring(commentIndex + 1);
+                }
+                lines.set(i, " ".repeat(indent) + versionKey + ": " + newVersion + restOfLine);
+                return;
+            }
+        }
+        int insertIndex = 0;
+        for (int i = 0; i < lines.size(); i++) {
+            String line = lines.get(i);
+            String trimmed = line.trim();
+            if (!trimmed.isEmpty() && !line.startsWith("#") && !trimmed.startsWith(versionKey)) {
+                insertIndex = i;
+                break;
+            }
+        }
+        String commentLine = "# Config version - do not modify (used for migration)";
+        lines.add(insertIndex, commentLine);
+        lines.add(insertIndex + 1, versionKey + ": " + newVersion);
+        if (insertIndex + 2 < lines.size() && !lines.get(insertIndex + 2).trim().isEmpty()) lines.add(insertIndex + 2, "");
     }
 
     private void loadConfig() {
@@ -593,21 +854,39 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         debugLogging = config.getBoolean("debug_logging", false);
         passivePhantomsEnabled = config.getBoolean("passive_phantoms_enabled", true);
         customSpawnControl = config.getBoolean("phantom_settings.custom_spawn_control", true);
-        endSpawnChance = config.getDouble("phantom_settings.end_spawn_chance", 0.05);
-        maxPhantomsPerChunk = config.getInt("phantom_settings.max_phantoms_per_chunk", 8);
+        
+        // Spawn settings with validation (invalid values clamped, no crash)
+        endSpawnChance = clamp(config.getDouble("phantom_settings.end_spawn_chance", 0.05), 0.0, 1.0, "end_spawn_chance");
+        maxPhantomsPerChunk = (int) clamp(config.getInt("phantom_settings.max_phantoms_per_chunk", 8), 1, 64, "max_phantoms_per_chunk");
+        spawnCheckRadius = clamp(config.getDouble("phantom_settings.spawn_check_radius", 64.0), 8.0, 256.0, "spawn_check_radius");
+        endSpawnIntervalTicks = (long) clamp(config.getInt("phantom_settings.end_spawn_interval_ticks", 200), 100, 600, "end_spawn_interval_ticks");
         
         // Movement improvement settings
         movementImprovementsEnabled = config.getBoolean("phantom_settings.movement_improvements_enabled", true);
-        stuckDetectionTicks = config.getInt("phantom_settings.stuck_detection_ticks", 100);
-        stuckThreshold = config.getInt("phantom_settings.stuck_threshold", 3);
-        stuckDistanceThreshold = config.getDouble("phantom_settings.stuck_distance_threshold", 1.0);
-        maxStuckAttempts = config.getInt("phantom_settings.max_stuck_attempts", 5);
+        stuckDetectionTicks = (int) clamp(config.getInt("phantom_settings.stuck_detection_ticks", 100), 20, 600, "stuck_detection_ticks");
+        stuckThreshold = (int) clamp(config.getInt("phantom_settings.stuck_threshold", 3), 1, 20, "stuck_threshold");
+        stuckDistanceThreshold = clamp(config.getDouble("phantom_settings.stuck_distance_threshold", 1.0), 0.1, 10.0, "stuck_distance_threshold");
+        maxStuckAttempts = (int) clamp(config.getInt("phantom_settings.max_stuck_attempts", 5), 1, 20, "max_stuck_attempts");
         
-        // Tree avoidance settings
+        // Tree avoidance (radius cast to int; large values = expensive block scan)
         treeAvoidanceEnabled = config.getBoolean("phantom_settings.tree_avoidance_enabled", true);
-        treeAvoidanceRadius = config.getDouble("phantom_settings.tree_avoidance_radius", 3.0);
+        treeAvoidanceRadius = clamp(config.getDouble("phantom_settings.tree_avoidance_radius", 3.0), 1.0, 16.0, "tree_avoidance_radius");
         
+        updateCheckerEnabled = config.getBoolean("update_checker", true);
         random = new Random();
+    }
+    
+    /** Clamp value to [min, max]; if clamped, log warning. Returns double for use with getInt/getDouble. */
+    private double clamp(double value, double min, double max, String key) {
+        if (value < min) {
+            getLogger().warning("Config phantom_settings." + key + " " + value + " is below minimum " + min + "; using " + min);
+            return min;
+        }
+        if (value > max) {
+            getLogger().warning("Config phantom_settings." + key + " " + value + " is above maximum " + max + "; using " + max);
+            return max;
+        }
+        return value;
     }
 
     @EventHandler(priority = EventPriority.HIGH)
@@ -757,12 +1036,23 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         if (world.getEnvironment() == World.Environment.NORMAL) {
             event.setCancelled(true);
             if (debugLogging) getLogger().info("Cancelled phantom spawn in Overworld");
+            return;
+        }
+        // In The End: enforce per-chunk cap for any spawn source (our task uses radius cap; this catches others)
+        if (world.getEnvironment() == World.Environment.THE_END) {
+            int chunkX = event.getLocation().getBlockX() >> 4;
+            int chunkZ = event.getLocation().getBlockZ() >> 4;
+            if (countPhantomsInChunk(world, chunkX, chunkZ) >= maxPhantomsPerChunk) {
+                event.setCancelled(true);
+                if (debugLogging) getLogger().info("Cancelled phantom spawn in The End (chunk " + chunkX + "," + chunkZ + " at cap " + maxPhantomsPerChunk + ")");
+            }
         }
     }
     
     // Custom phantom spawning in The End
     public void spawnPhantomsInEnd() {
         if (!passivePhantomsEnabled || !customSpawnControl) return;
+        if (endSpawnChance <= 0.0) return;
         
         for (World world : Bukkit.getWorlds()) {
             if (world.getEnvironment() != World.Environment.THE_END) continue;
@@ -776,38 +1066,46 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
                     Location playerLoc = targetPlayer.getLocation();
                     int chunkX = playerLoc.getBlockX() >> 4;
                     int chunkZ = playerLoc.getBlockZ() >> 4;
-                    int currentPhantoms = countPhantomsInChunk(world, chunkX, chunkZ);
-                    if (currentPhantoms >= maxPhantomsPerChunk) {
-                        if (debugLogging) getLogger().info("Chunk mobcap reached at " + chunkX + "," + chunkZ + " in " + world.getName() + " (" + currentPhantoms + "/" + maxPhantomsPerChunk + " phantoms)");
+                    // Cap by phantoms near player (radius), not just in chunk - phantoms fly so per-chunk alone would allow unlimited spawns
+                    int currentPhantomsNear = countPhantomsNear(world, playerLoc, spawnCheckRadius);
+                    if (currentPhantomsNear >= maxPhantomsPerChunk) {
+                        if (debugLogging) getLogger().info("Spawn cap reached near player at " + chunkX + "," + chunkZ + " (" + currentPhantomsNear + "/" + maxPhantomsPerChunk + " phantoms within " + (int)spawnCheckRadius + " blocks)");
                         continue;
                     }
-                    // Spawn phantom at a safe location away from chorus fruit
+                    // Spawn phantom at a safe location away from chorus fruit (still in player's chunk)
                     Location spawnLoc = findSafeSpawnLocation(world, chunkX, chunkZ);
                     Phantom phantom = world.spawn(spawnLoc, Phantom.class);
                     if (phantom != null) {
                         removeAggressivePhantom(phantom.getUniqueId(), "spawned");
-                        if (debugLogging) getLogger().info("Spawned phantom in The End at " + spawnLoc + " (chunk " + chunkX + "," + chunkZ + ": " + (currentPhantoms + 1) + "/" + maxPhantomsPerChunk + " phantoms)");
+                        if (debugLogging) getLogger().info("Spawned phantom in The End at " + spawnLoc + " (" + (currentPhantomsNear + 1) + "/" + maxPhantomsPerChunk + " near player)");
                     }
                 }
             }
         }
     }
     
-    // Clean up tracking when phantoms die
     @EventHandler
     public void onPhantomDeath(org.bukkit.event.entity.EntityDeathEvent event) {
         if (event.getEntity() instanceof Phantom) {
             UUID phantomId = event.getEntity().getUniqueId();
             removeAggressivePhantom(phantomId, "died");
-            
-            // Clean up movement tracking
-            lastPhantomLocations.remove(phantomId);
-            stuckCounter.remove(phantomId);
-            stuckAttempts.remove(phantomId);
-            lastMovementTime.remove(phantomId);
-            
+            cleanupPhantomData(phantomId);
             if (debugLogging) getLogger().info("Phantom died - removed from all tracking");
         }
+    }
+    
+    @EventHandler
+    public void onPlayerJoin(PlayerJoinEvent event) {
+        if (!updateCheckerEnabled || !event.getPlayer().hasPermission("passivephantoms.notify")) return;
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (updateAvailable && latestVersion != null) {
+                org.bukkit.entity.Player p = event.getPlayer();
+                if (p != null && p.isOnline()) {
+                    p.sendMessage("§6[PassivePhantoms] §eUpdate available: §f" + latestVersion + " §7(current: " + getDescription().getVersion() + ")");
+                    p.sendMessage("§7Download: §fhttps://modrinth.com/plugin/" + MODRINTH_PROJECT_ID);
+                }
+            }
+        }, 100L);
     }
 
     @Override
@@ -843,9 +1141,13 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
                 sender.sendMessage("§7Plugin enabled: §a" + passivePhantomsEnabled);
                 sender.sendMessage("§7Debug logging: §a" + debugLogging);
                 sender.sendMessage("§7Custom spawn control: §a" + customSpawnControl);
+                sender.sendMessage("§7End spawn chance: §a" + (endSpawnChance * 100) + "% §7(every " + (endSpawnIntervalTicks / 20) + "s)");
                 sender.sendMessage("§7Movement improvements: §a" + movementImprovementsEnabled);
                 sender.sendMessage("§7Aggressive phantoms tracked: §a" + aggressivePhantoms.size());
                 sender.sendMessage("§7Max phantoms per chunk: §a" + maxPhantomsPerChunk);
+                sender.sendMessage("§7Spawn check radius: §a" + (int)spawnCheckRadius + " blocks");
+                sender.sendMessage("§7Update checker: §a" + (updateCheckerEnabled ? "Enabled" : "Disabled"));
+                if (updateAvailable && latestVersion != null) sender.sendMessage("§eUpdate available: §f" + latestVersion + " §7(current: " + getDescription().getVersion() + ")");
                 if (movementImprovementsEnabled) {
                     sender.sendMessage("§7Movement monitoring: §aEnabled (every " + stuckDetectionTicks + " ticks)");
                 }

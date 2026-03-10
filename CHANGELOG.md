@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.2.6] - 2025-03-09
+
+### Added
+- Locktight-style config migration (config_version, merge with default, preserve comments).
+- Modrinth update checker (async; notifies ops on join via `passivephantoms.notify`). Supports dev versions (e.g. -Dev1a, 1.2.6b1).
+- Config options: `update_checker`, `spawn_check_radius`, `end_spawn_interval_ticks`. All numeric settings validated and clamped to safe ranges.
+- Per-spawn cap now uses phantoms **near the player** (within `spawn_check_radius`) so flying phantoms can’t bypass the limit; End spawn event also enforces per-chunk cap.
+
+### Changed
+- Spawn cap is radius-based (default 64 blocks) instead of chunk-only. Stuck/tree logic runs only for phantoms within 128 blocks of a player. Entity counts use `getNearbyEntities` for performance.
+- Config comments and status command updated. Early exit when `end_spawn_chance` is 0.
+
+### Fixed
+- Memory: cleanup on phantom death (all tracking maps), clear all maps on disable, prune stale UUIDs from aggressive set in movement monitor.
+- `max_phantoms_per_chunk` now enforced correctly when AFK in the End (was bypassed by phantoms leaving chunk).
+
 ## [1.2.5] - 2025-07-07
 
 **Note: Movement improvements are experimental and phantoms may still get hung up on chorus trees.**
