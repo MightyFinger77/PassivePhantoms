@@ -11,6 +11,7 @@ import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityTargetLivingEntityEvent;
 import org.bukkit.event.entity.EntitySpawnEvent;
 import org.bukkit.event.entity.CreatureSpawnEvent;
+import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.World;
 import org.bukkit.Location;
@@ -49,6 +50,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.logging.Level;
 import java.util.Locale;
+import java.util.function.Consumer;
 
 public class PassivePhantoms extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
 
@@ -92,6 +94,67 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     private boolean updateCheckerEnabled;
     private volatile String latestVersion;
     private volatile boolean updateAvailable = false;
+
+    /** Folia only — do not use {@code getGlobalRegionScheduler()} for detection; Paper exposes it too. */
+    private boolean isFolia() {
+        try {
+            Class.forName("io.papermc.paper.threadedregions.RegionizedServer");
+            return true;
+        } catch (ClassNotFoundException ignored) {
+            return false;
+        }
+    }
+
+    private void runSync(Runnable task) {
+        if (isFolia()) {
+            try {
+                Object scheduler = getServer().getClass().getMethod("getGlobalRegionScheduler").invoke(getServer());
+                scheduler.getClass().getMethod("execute", Plugin.class, Runnable.class).invoke(scheduler, this, task);
+                return;
+            } catch (Exception ignored) {
+            }
+        }
+        Bukkit.getScheduler().runTask(this, task);
+    }
+
+    private void runLater(Runnable task, long delayTicks) {
+        if (isFolia()) {
+            try {
+                Object scheduler = getServer().getClass().getMethod("getGlobalRegionScheduler").invoke(getServer());
+                scheduler.getClass().getMethod("runDelayed", Plugin.class, Consumer.class, long.class)
+                        .invoke(scheduler, this, (Consumer<Object>) t -> task.run(), delayTicks);
+                return;
+            } catch (Exception ignored) {
+            }
+        }
+        Bukkit.getScheduler().runTaskLater(this, task, delayTicks);
+    }
+
+    private void runTimer(Runnable task, long delayTicks, long periodTicks) {
+        if (isFolia()) {
+            try {
+                Object scheduler = getServer().getClass().getMethod("getGlobalRegionScheduler").invoke(getServer());
+                scheduler.getClass().getMethod("runAtFixedRate", Plugin.class, Consumer.class, long.class, long.class)
+                        .invoke(scheduler, this, (Consumer<Object>) t -> task.run(), delayTicks, periodTicks);
+                return;
+            } catch (Exception ignored) {
+            }
+        }
+        Bukkit.getScheduler().runTaskTimer(this, task, delayTicks, periodTicks);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void runAsync(Runnable task) {
+        if (isFolia()) {
+            try {
+                Object async = getServer().getClass().getMethod("getAsyncScheduler").invoke(getServer());
+                async.getClass().getMethod("runNow", Plugin.class, Consumer.class)
+                        .invoke(async, this, (Consumer<Object>) st -> task.run());
+                return;
+            } catch (Exception ignored) { }
+        }
+        Bukkit.getScheduler().runTaskAsynchronously(this, task);
+    }
     
     // Helper method to add phantom to aggressive set with logging
     private void addAggressivePhantom(UUID phantomId, String reason) {
@@ -495,12 +558,12 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         // Start custom phantom spawning in The End if enabled
         if (passivePhantomsEnabled && customSpawnControl) {
             long interval = endSpawnIntervalTicks;
-            Bukkit.getScheduler().runTaskTimer(this, this::spawnPhantomsInEnd, interval, interval);
+            runTimer(this::spawnPhantomsInEnd, interval, interval);
         }
         
         // Start optimized movement monitoring if enabled
         if (passivePhantomsEnabled && movementImprovementsEnabled) {
-            Bukkit.getScheduler().runTaskTimer(this, () -> {
+            runTimer(() -> {
                 monitorPhantomMovement();
             }, stuckDetectionTicks, stuckDetectionTicks);
         }
@@ -531,7 +594,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     /** Modrinth update check (async); notifies console and players with permission on join. */
     private void runUpdateCheckAsync() {
         if (!updateCheckerEnabled) return;
-        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+        runAsync(() -> {
             try {
                 HttpURLConnection conn = (HttpURLConnection) URI.create(String.format(MODRINTH_VERSION_URL, MODRINTH_PROJECT_ID)).toURL().openConnection();
                 conn.setRequestMethod("GET");
@@ -549,7 +612,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
                 String currentVersion = getDescription().getVersion();
                 final String latest = fetchedVersion.trim();
                 final boolean newer = isNewerVersion(latest, currentVersion);
-                Bukkit.getScheduler().runTask(this, () -> {
+                runSync(() -> {
                     latestVersion = latest;
                     updateAvailable = newer;
                     if (newer) {
@@ -671,6 +734,21 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         try { return Integer.parseInt(s); } catch (NumberFormatException e) { return def; }
     }
 
+    private boolean hasMissingLeafKeysComparedToJarDefaults(YamlConfiguration current, YamlConfiguration defaults, String fileVersionKey) {
+        List<String> missing = new ArrayList<>();
+        for (String key : defaults.getKeys(true)) {
+            if (defaults.isConfigurationSection(key)) continue;
+            if (key.equals(fileVersionKey)) continue;
+            if (key.equals("config_version") || key.equals("messages_version") || key.equals("gui_version")) continue;
+            if (!current.contains(key)) missing.add(key);
+        }
+        if (!missing.isEmpty()) {
+            getLogger().info("Config migration: merging missing keys from jar defaults: " + String.join(", ", missing));
+            return true;
+        }
+        return false;
+    }
+
     /**
      * Locktight-style config migration: merge default config (comments/formatting) with user values.
      * Preserves comments and adds missing keys without wiping user settings.
@@ -692,7 +770,10 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
             YamlConfiguration currentConfig = YamlConfiguration.loadConfiguration(configFile);
             int defaultVersion = defaultConfig.getInt("config_version", 1);
             int currentVersion = currentConfig.getInt("config_version", 0);
-            if (currentVersion >= defaultVersion && currentConfig.contains("config_version")) return;
+            boolean missingLeaves = hasMissingLeafKeysComparedToJarDefaults(currentConfig, defaultConfig, "config_version");
+            if (currentVersion == defaultVersion && currentConfig.contains("config_version") && !missingLeaves) {
+                return;
+            }
             getLogger().info("Config migration: current version=" + currentVersion + ", default version=" + defaultVersion);
             List<String> mergedLines = mergeConfigs(defaultLines, currentConfig, defaultConfig);
             Set<String> deprecatedKeys = findDeprecatedKeys(currentConfig, defaultConfig);
@@ -919,7 +1000,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
                 Player nearestPlayer = findNearestPlayer(phantom);
                 if (nearestPlayer != null) {
                     // Schedule the re-targeting for next tick to avoid event conflicts
-                    Bukkit.getScheduler().runTask(this, () -> {
+                    runSync(() -> {
                         if (phantom.isValid() && !phantom.isDead() && aggressivePhantoms.contains(phantomId)) {
                             phantom.setTarget(nearestPlayer);
                             if (debugLogging) getLogger().info("Re-targeted aggressive phantom " + phantomId + " to " + nearestPlayer.getName());
@@ -1000,7 +1081,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         addAggressivePhantom(phantomId, "direct attack from " + damager.getName());
         
         // Force the phantom to target the player immediately
-        Bukkit.getScheduler().runTask(this, () -> {
+        runSync(() -> {
             if (phantom.isValid() && !phantom.isDead()) {
                 phantom.setTarget(damager);
                 if (debugLogging) getLogger().info("Forced phantom " + phantomId + " to target " + damager.getName());
@@ -1097,7 +1178,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
         if (!updateCheckerEnabled || !event.getPlayer().hasPermission("passivephantoms.notify")) return;
-        Bukkit.getScheduler().runTaskLater(this, () -> {
+        runLater(() -> {
             if (updateAvailable && latestVersion != null) {
                 org.bukkit.entity.Player p = event.getPlayer();
                 if (p != null && p.isOnline()) {
