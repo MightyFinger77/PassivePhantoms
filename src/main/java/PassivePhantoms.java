@@ -36,21 +36,23 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.io.File;
-import java.util.HashSet;
 import java.util.Set;
+import java.util.HashSet;
 import java.util.UUID;
-import java.util.Random;
-import java.util.Collection;
 import java.util.List;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.Stack;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.logging.Level;
 import java.util.Locale;
 import java.util.function.Consumer;
+import java.util.function.IntConsumer;
 
 public class PassivePhantoms extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
 
@@ -60,43 +62,50 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     private static final String MODRINTH_VERSION_URL = "https://api.modrinth.com/v2/project/%s/version";
     private static final String MODRINTH_PROJECT_ID = "passivephantoms";
 
-    private boolean debugLogging;
-    private boolean passivePhantomsEnabled;
-    private boolean customSpawnControl;
-    private double endSpawnChance;
-    private int maxPhantomsPerChunk;
+    private volatile boolean debugLogging;
+    private volatile boolean passivePhantomsEnabled;
+    private volatile boolean customSpawnControl;
+    private volatile double endSpawnChance;
+    private volatile int maxPhantomsPerChunk;
     /** Radius (blocks) around player to count phantoms for cap; prevents flying phantoms from bypassing by leaving chunk. */
-    private double spawnCheckRadius;
+    private volatile double spawnCheckRadius;
     /** Ticks between spawn rolls in The End (200 = 10 seconds). Only applied on reload/restart. */
-    private long endSpawnIntervalTicks;
-    private Random random;
+    private volatile long endSpawnIntervalTicks;
     
-    // Simple set to track aggressive phantoms
-    private Set<UUID> aggressivePhantoms = new HashSet<>();
+    // Concurrent: Folia may touch these from multiple region threads
+    private final Set<UUID> aggressivePhantoms = ConcurrentHashMap.newKeySet();
     
     // Movement tracking for stuck detection
-    private Map<UUID, Location> lastPhantomLocations = new HashMap<>();
-    private Map<UUID, Integer> stuckCounter = new HashMap<>();
-    private Map<UUID, Long> lastMovementTime = new HashMap<>();
-    private Map<UUID, Integer> stuckAttempts = new HashMap<>();
-    private Map<UUID, Long> lastTreeAvoidanceTime = new HashMap<>();
+    private final Map<UUID, Location> lastPhantomLocations = new ConcurrentHashMap<>();
+    private final Map<UUID, Integer> stuckCounter = new ConcurrentHashMap<>();
+    private final Map<UUID, Long> lastMovementTime = new ConcurrentHashMap<>();
+    private final Map<UUID, Integer> stuckAttempts = new ConcurrentHashMap<>();
+    private final Map<UUID, Long> lastTreeAvoidanceTime = new ConcurrentHashMap<>();
     
     // Configuration for movement improvements
-    private boolean movementImprovementsEnabled;
-    private int stuckDetectionTicks;
-    private int stuckThreshold;
-    private double stuckDistanceThreshold;
-    private int maxStuckAttempts;
-    private boolean treeAvoidanceEnabled;
-    private double treeAvoidanceRadius;
+    private volatile boolean movementImprovementsEnabled;
+    private volatile int stuckDetectionTicks;
+    private volatile int stuckThreshold;
+    private volatile double stuckDistanceThreshold;
+    private volatile int maxStuckAttempts;
+    private volatile boolean treeAvoidanceEnabled;
+    private volatile double treeAvoidanceRadius;
     
     // Modrinth update checker
-    private boolean updateCheckerEnabled;
+    private volatile boolean updateCheckerEnabled;
     private volatile String latestVersion;
     private volatile boolean updateAvailable = false;
 
-    /** Folia only — do not use {@code getGlobalRegionScheduler()} for detection; Paper exposes it too. */
-    private boolean isFolia() {
+    /** Folia/Paper tasks to cancel on disable (BukkitTask or Folia ScheduledTask). */
+    private final List<Object> liveTasks = new CopyOnWriteArrayList<>();
+
+    /**
+     * Folia only — do not use {@code getGlobalRegionScheduler()} for detection; Paper exposes it too.
+     * Cached: Class.forName is unnecessary on every schedule call.
+     */
+    private final boolean folia = detectFolia();
+
+    private static boolean detectFolia() {
         try {
             Class.forName("io.papermc.paper.threadedregions.RegionizedServer");
             return true;
@@ -105,42 +114,155 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         }
     }
 
+    private boolean isFolia() {
+        return folia;
+    }
+
+    private void trackTask(Object task) {
+        if (task != null) liveTasks.add(task);
+    }
+
+    private void cancelAllTasks() {
+        for (Object task : liveTasks) {
+            try {
+                task.getClass().getMethod("cancel").invoke(task);
+            } catch (Exception ignored) {
+            }
+        }
+        liveTasks.clear();
+    }
+
+    /** True on Paper always; on Folia only if this thread owns the chunk. */
+    private boolean isOwnedByCurrentRegion(World world, int chunkX, int chunkZ) {
+        if (!isFolia()) return true;
+        try {
+            Object result = Bukkit.class
+                    .getMethod("isOwnedByCurrentRegion", World.class, int.class, int.class)
+                    .invoke(null, world, chunkX, chunkZ);
+            return Boolean.TRUE.equals(result);
+        } catch (Exception e) {
+            try {
+                Object result = getServer().getClass()
+                        .getMethod("isOwnedByCurrentRegion", World.class, int.class, int.class)
+                        .invoke(getServer(), world, chunkX, chunkZ);
+                return Boolean.TRUE.equals(result);
+            } catch (Exception e2) {
+                getLogger().log(Level.WARNING, "isOwnedByCurrentRegion unavailable", e2);
+                return false;
+            }
+        }
+    }
+
+    private boolean isOwnedByCurrentRegion(Location location) {
+        if (location == null || location.getWorld() == null) return false;
+        if (!isFolia()) return true;
+        return isOwnedByCurrentRegion(location.getWorld(), location.getBlockX() >> 4, location.getBlockZ() >> 4);
+    }
+
+    private boolean isOwnedByCurrentRegion(Entity entity) {
+        if (entity == null) return false;
+        if (!isFolia()) return true;
+        try {
+            Object result = Bukkit.class.getMethod("isOwnedByCurrentRegion", Entity.class).invoke(null, entity);
+            return Boolean.TRUE.equals(result);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Non-world work only on Folia (global region). Prefer {@link #runAtEntity} / {@link #runAtChunk} for world work. */
     private void runSync(Runnable task) {
         if (isFolia()) {
             try {
                 Object scheduler = getServer().getClass().getMethod("getGlobalRegionScheduler").invoke(getServer());
                 scheduler.getClass().getMethod("execute", Plugin.class, Runnable.class).invoke(scheduler, this, task);
                 return;
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                getLogger().log(Level.SEVERE, "Folia GlobalRegionScheduler.execute failed", e);
+                return;
             }
         }
         Bukkit.getScheduler().runTask(this, task);
-    }
-
-    private void runLater(Runnable task, long delayTicks) {
-        if (isFolia()) {
-            try {
-                Object scheduler = getServer().getClass().getMethod("getGlobalRegionScheduler").invoke(getServer());
-                scheduler.getClass().getMethod("runDelayed", Plugin.class, Consumer.class, long.class)
-                        .invoke(scheduler, this, (Consumer<Object>) t -> task.run(), delayTicks);
-                return;
-            } catch (Exception ignored) {
-            }
-        }
-        Bukkit.getScheduler().runTaskLater(this, task, delayTicks);
     }
 
     private void runTimer(Runnable task, long delayTicks, long periodTicks) {
         if (isFolia()) {
             try {
                 Object scheduler = getServer().getClass().getMethod("getGlobalRegionScheduler").invoke(getServer());
-                scheduler.getClass().getMethod("runAtFixedRate", Plugin.class, Consumer.class, long.class, long.class)
+                Object scheduled = scheduler.getClass()
+                        .getMethod("runAtFixedRate", Plugin.class, Consumer.class, long.class, long.class)
                         .invoke(scheduler, this, (Consumer<Object>) t -> task.run(), delayTicks, periodTicks);
+                trackTask(scheduled);
                 return;
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                getLogger().log(Level.SEVERE, "Folia GlobalRegionScheduler.runAtFixedRate failed", e);
+                return;
             }
         }
-        Bukkit.getScheduler().runTaskTimer(this, task, delayTicks, periodTicks);
+        trackTask(Bukkit.getScheduler().runTaskTimer(this, task, delayTicks, periodTicks));
+    }
+
+    /** Run on the region that owns this chunk. Safe to call from any thread on Folia. @return false if scheduling failed */
+    private boolean runAtChunk(World world, int chunkX, int chunkZ, Runnable task) {
+        if (world == null || task == null) return false;
+        if (isFolia()) {
+            try {
+                Object scheduler = getServer().getClass().getMethod("getRegionScheduler").invoke(getServer());
+                scheduler.getClass()
+                        .getMethod("execute", Plugin.class, World.class, int.class, int.class, Runnable.class)
+                        .invoke(scheduler, this, world, chunkX, chunkZ, task);
+                return true;
+            } catch (Exception e) {
+                getLogger().log(Level.SEVERE, "Folia RegionScheduler.execute failed", e);
+                return false;
+            }
+        }
+        Bukkit.getScheduler().runTask(this, task);
+        return true;
+    }
+
+    /** Run on the entity's owning region. Safe to call from any thread. */
+    private void runAtEntity(Entity entity, Runnable task) {
+        runAtEntity(entity, task, null);
+    }
+
+    private void runAtEntity(Entity entity, Runnable task, Runnable retired) {
+        if (entity == null) {
+            if (retired != null) retired.run();
+            return;
+        }
+        if (isFolia()) {
+            try {
+                Object scheduler = entity.getClass().getMethod("getScheduler").invoke(entity);
+                scheduler.getClass().getMethod("run", Plugin.class, Consumer.class, Runnable.class)
+                        .invoke(scheduler, this, (Consumer<Object>) t -> task.run(), retired);
+                return;
+            } catch (Exception e) {
+                getLogger().log(Level.SEVERE, "Folia EntityScheduler.run failed", e);
+                if (retired != null) retired.run();
+                return;
+            }
+        }
+        Bukkit.getScheduler().runTask(this, task);
+    }
+
+    /** Delayed entity-region task (Folia EntityScheduler / Paper sync delayed). */
+    private void runAtEntityLater(Entity entity, Runnable task, long delayTicks) {
+        if (entity == null) return;
+        if (isFolia()) {
+            try {
+                Object scheduler = entity.getClass().getMethod("getScheduler").invoke(entity);
+                Object scheduled = scheduler.getClass()
+                        .getMethod("runDelayed", Plugin.class, Consumer.class, Runnable.class, long.class)
+                        .invoke(scheduler, this, (Consumer<Object>) t -> task.run(), null, delayTicks);
+                trackTask(scheduled);
+                return;
+            } catch (Exception e) {
+                getLogger().log(Level.SEVERE, "Folia EntityScheduler.runDelayed failed", e);
+                return;
+            }
+        }
+        trackTask(Bukkit.getScheduler().runTaskLater(this, task, delayTicks));
     }
 
     @SuppressWarnings("unchecked")
@@ -151,9 +273,41 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
                 async.getClass().getMethod("runNow", Plugin.class, Consumer.class)
                         .invoke(async, this, (Consumer<Object>) st -> task.run());
                 return;
-            } catch (Exception ignored) { }
+            } catch (Exception e) {
+                getLogger().log(Level.SEVERE, "Folia AsyncScheduler.runNow failed", e);
+                return;
+            }
         }
         Bukkit.getScheduler().runTaskAsynchronously(this, task);
+    }
+
+    private void reply(CommandSender sender, String message) {
+        if (sender instanceof Player) {
+            Player player = (Player) sender;
+            if (isFolia()) {
+                runAtEntity(player, () -> player.sendMessage(message));
+            } else {
+                player.sendMessage(message);
+            }
+        } else {
+            sender.sendMessage(message);
+        }
+    }
+
+    private void reply(CommandSender sender, List<String> messages) {
+        if (sender instanceof Player) {
+            Player player = (Player) sender;
+            Runnable send = () -> {
+                for (String message : messages) player.sendMessage(message);
+            };
+            if (isFolia()) {
+                runAtEntity(player, send);
+            } else {
+                send.run();
+            }
+        } else {
+            for (String message : messages) sender.sendMessage(message);
+        }
     }
     
     // Helper method to add phantom to aggressive set with logging
@@ -173,28 +327,118 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
             if (debugLogging) getLogger().info("Phantom " + phantomId + " not found in aggressive set: " + reason);
         }
     }
-    
-    /** Count phantoms in one chunk. Uses getNearbyEntities for the chunk column to avoid iterating the whole world. */
+
+    /** Iterate loaded chunks overlapping a horizontal radius (inclusive). */
+    private void forEachChunkInRadius(Location center, double radiusBlocks, ChunkConsumer consumer) {
+        World world = center.getWorld();
+        if (world == null) return;
+        int minCX = (int) Math.floor((center.getX() - radiusBlocks) / 16.0);
+        int maxCX = (int) Math.floor((center.getX() + radiusBlocks) / 16.0);
+        int minCZ = (int) Math.floor((center.getZ() - radiusBlocks) / 16.0);
+        int maxCZ = (int) Math.floor((center.getZ() + radiusBlocks) / 16.0);
+        for (int cx = minCX; cx <= maxCX; cx++) {
+            for (int cz = minCZ; cz <= maxCZ; cz++) {
+                consumer.accept(world, cx, cz);
+            }
+        }
+    }
+
+    @FunctionalInterface
+    private interface ChunkConsumer {
+        void accept(World world, int chunkX, int chunkZ);
+    }
+
+    /**
+     * Count phantoms in one chunk. Caller must own the chunk region on Folia
+     * (e.g. CreatureSpawnEvent at that chunk, or {@link #runAtChunk}).
+     */
     private int countPhantomsInChunk(World world, int chunkX, int chunkZ) {
-        Location chunkCenter = new Location(world, (chunkX << 4) + 8, 64, (chunkZ << 4) + 8);
-        Collection<Entity> inChunk = world.getNearbyEntities(chunkCenter, 8, 128, 8);
+        if (world == null || !world.isChunkLoaded(chunkX, chunkZ)) return 0;
+        if (!isOwnedByCurrentRegion(world, chunkX, chunkZ)) return 0;
         int count = 0;
-        for (Entity entity : inChunk) {
+        for (Entity entity : world.getChunkAt(chunkX, chunkZ).getEntities()) {
             if (entity instanceof Phantom) count++;
         }
         return count;
     }
-    
-    /** Count phantoms within radius of a location. Uses getNearbyEntities so we only scan a box, not the whole world. */
+
+    /**
+     * Sync count of phantoms near a location using only chunks owned by the current region.
+     * Safe on Folia when already on a region thread; may under-count across region borders.
+     * Prefer {@link #countPhantomsNearAsync} when a full radius count is required.
+     */
     private int countPhantomsNear(World world, Location center, double radiusBlocks) {
         if (center == null || world == null) return 0;
         double radiusSq = radiusBlocks * radiusBlocks;
-        Collection<Entity> nearby = world.getNearbyEntities(center, radiusBlocks, radiusBlocks, radiusBlocks);
         int count = 0;
-        for (Entity entity : nearby) {
-            if (entity instanceof Phantom && center.distanceSquared(entity.getLocation()) <= radiusSq) count++;
+        int minCX = (int) Math.floor((center.getX() - radiusBlocks) / 16.0);
+        int maxCX = (int) Math.floor((center.getX() + radiusBlocks) / 16.0);
+        int minCZ = (int) Math.floor((center.getZ() - radiusBlocks) / 16.0);
+        int maxCZ = (int) Math.floor((center.getZ() + radiusBlocks) / 16.0);
+        for (int cx = minCX; cx <= maxCX; cx++) {
+            for (int cz = minCZ; cz <= maxCZ; cz++) {
+                if (!world.isChunkLoaded(cx, cz)) continue;
+                if (!isOwnedByCurrentRegion(world, cx, cz)) continue;
+                for (Entity entity : world.getChunkAt(cx, cz).getEntities()) {
+                    if (!(entity instanceof Phantom)) continue;
+                    if (center.distanceSquared(entity.getLocation()) <= radiusSq) count++;
+                }
+            }
         }
         return count;
+    }
+
+    /**
+     * Full radius phantom count. Paper: sync. Folia: RegionScheduler per chunk, then callback.
+     * Callback may run on a region thread — hop with {@link #runAtEntity} before touching other entities.
+     */
+    private void countPhantomsNearAsync(Location center, double radiusBlocks, IntConsumer callback) {
+        World world = center.getWorld();
+        if (center == null || world == null) {
+            callback.accept(0);
+            return;
+        }
+        if (!isFolia()) {
+            callback.accept(countPhantomsNear(world, center, radiusBlocks));
+            return;
+        }
+
+        final double radiusSq = radiusBlocks * radiusBlocks;
+        final List<int[]> chunks = new ArrayList<>();
+        forEachChunkInRadius(center, radiusBlocks, (w, cx, cz) -> chunks.add(new int[]{cx, cz}));
+        if (chunks.isEmpty()) {
+            callback.accept(0);
+            return;
+        }
+
+        final AtomicInteger pending = new AtomicInteger(chunks.size());
+        final AtomicInteger total = new AtomicInteger();
+        final Set<UUID> seen = ConcurrentHashMap.newKeySet();
+        final Location centerCopy = center.clone();
+
+        for (int[] chunk : chunks) {
+            final int cx = chunk[0];
+            final int cz = chunk[1];
+            Runnable work = () -> {
+                try {
+                    if (!world.isChunkLoaded(cx, cz)) return;
+                    for (Entity entity : world.getChunkAt(cx, cz).getEntities()) {
+                        if (!(entity instanceof Phantom)) continue;
+                        if (centerCopy.distanceSquared(entity.getLocation()) > radiusSq) continue;
+                        if (seen.add(entity.getUniqueId())) total.incrementAndGet();
+                    }
+                } finally {
+                    if (pending.decrementAndGet() == 0) {
+                        callback.accept(total.get());
+                    }
+                }
+            };
+            if (!runAtChunk(world, cx, cz, work)) {
+                if (pending.decrementAndGet() == 0) {
+                    callback.accept(total.get());
+                }
+            }
+        }
     }
     
     // Optimized method to check if a location is near chorus fruit
@@ -205,18 +449,21 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         
         // Use squared distance for better performance (avoid square root)
         int radiusSquared = radius * radius;
+        int baseX = location.getBlockX();
+        int baseY = location.getBlockY();
+        int baseZ = location.getBlockZ();
         
         for (int x = -radius; x <= radius; x++) {
             for (int y = -radius; y <= radius; y++) {
                 for (int z = -radius; z <= radius; z++) {
                     // Skip if outside the sphere (performance optimization)
                     if (x * x + y * y + z * z > radiusSquared) continue;
+                    int bx = baseX + x;
+                    int by = baseY + y;
+                    int bz = baseZ + z;
+                    if (!isOwnedByCurrentRegion(world, bx >> 4, bz >> 4)) continue;
                     
-                    Block block = world.getBlockAt(
-                        location.getBlockX() + x,
-                        location.getBlockY() + y,
-                        location.getBlockZ() + z
-                    );
+                    Block block = world.getBlockAt(bx, by, bz);
                     
                     Material type = block.getType();
                     if (type == Material.CHORUS_PLANT || type == Material.CHORUS_FLOWER) {
@@ -228,7 +475,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         return false;
     }
     
-    // Helper method to find a safe spawn location away from chorus fruit
+    // Helper method to find a safe spawn location away from chorus fruit (caller must own chunk)
     private Location findSafeSpawnLocation(World world, int chunkX, int chunkZ) {
         int baseX = chunkX << 4;
         int baseZ = chunkZ << 4;
@@ -236,8 +483,9 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         int maxAttempts = 20;
         
         while (attempts < maxAttempts) {
-            double x = baseX + random.nextInt(16) + 0.5;
-            double z = baseZ + random.nextInt(16) + 0.5;
+            ThreadLocalRandom rng = ThreadLocalRandom.current();
+            double x = baseX + rng.nextInt(16) + 0.5;
+            double z = baseZ + rng.nextInt(16) + 0.5;
             double y = world.getHighestBlockYAt((int)x, (int)z) + 10;
             Location testLoc = new Location(world, x, y, z);
             
@@ -248,8 +496,9 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         }
         
         // If no safe location found, return a random one anyway
-        double x = baseX + random.nextInt(16) + 0.5;
-        double z = baseZ + random.nextInt(16) + 0.5;
+        ThreadLocalRandom rng = ThreadLocalRandom.current();
+        double x = baseX + rng.nextInt(16) + 0.5;
+        double z = baseZ + rng.nextInt(16) + 0.5;
         double y = world.getHighestBlockYAt((int)x, (int)z) + 10;
         return new Location(world, x, y, z);
     }
@@ -257,6 +506,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     // Helper method to help stuck phantoms escape
     private void helpPhantomEscape(Phantom phantom) {
         if (!phantom.isValid() || phantom.isDead()) return;
+        if (!isOwnedByCurrentRegion(phantom)) return;
         
         Location currentLoc = phantom.getLocation();
         UUID phantomId = phantom.getUniqueId();
@@ -272,10 +522,12 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
             stuckCounter.put(phantomId, 0);
             lastMovementTime.put(phantomId, System.currentTimeMillis());
         } else {
-            // If no escape location found, try to move the phantom up
+            // If no escape location found, try to move the phantom up (same chunk — always owned)
             Location upLoc = currentLoc.clone().add(0, 5, 0);
-            phantom.teleport(upLoc);
-            if (debugLogging) getLogger().info("Moved stuck phantom " + phantomId + " upward");
+            if (isOwnedByCurrentRegion(upLoc)) {
+                phantom.teleport(upLoc);
+                if (debugLogging) getLogger().info("Moved stuck phantom " + phantomId + " upward");
+            }
         }
     }
     
@@ -284,7 +536,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         World world = currentLoc.getWorld();
         if (world == null) return null;
         
-        // Try different directions and heights
+        // Prefer upward escapes (same chunk) before horizontal (may cross region)
         Location[] escapeAttempts = {
             currentLoc.clone().add(0, 8, 0),   // Straight up
             currentLoc.clone().add(5, 3, 0),   // North and up
@@ -298,6 +550,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         };
         
         for (Location attempt : escapeAttempts) {
+            if (!isOwnedByCurrentRegion(attempt)) continue;
             if (isLocationSafe(attempt)) {
                 return attempt;
             }
@@ -309,6 +562,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     // Helper method to check if a location is safe for phantoms
     private boolean isLocationSafe(Location location) {
         if (location.getWorld() == null) return false;
+        if (!isOwnedByCurrentRegion(location)) return false;
         
         // Check if the location is not inside blocks
         Block block = location.getBlock();
@@ -318,7 +572,9 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         
         // Check if there's enough space above
         for (int y = 1; y <= 3; y++) {
-            Block above = location.clone().add(0, y, 0).getBlock();
+            Location aboveLoc = location.clone().add(0, y, 0);
+            if (!isOwnedByCurrentRegion(aboveLoc)) return false;
+            Block above = aboveLoc.getBlock();
             if (above.getType() != Material.AIR && !above.getType().isSolid()) {
                 return false;
             }
@@ -331,6 +587,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     // Helper method to guide phantoms to fly around trees naturally
     private void guidePhantomAroundTrees(Phantom phantom) {
         if (!phantom.isValid() || phantom.isDead()) return;
+        if (!isOwnedByCurrentRegion(phantom)) return;
         
         Location currentLoc = phantom.getLocation();
         UUID phantomId = phantom.getUniqueId();
@@ -395,21 +652,24 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         Location nearest = null;
         double nearestDistance = Double.MAX_VALUE;
         int radiusSquared = radius * radius;
+        int baseX = location.getBlockX();
+        int baseY = location.getBlockY();
+        int baseZ = location.getBlockZ();
         for (int x = -radius; x <= radius; x++) {
             for (int y = -radius; y <= radius; y++) {
                 for (int z = -radius; z <= radius; z++) {
                     if (x * x + y * y + z * z > radiusSquared) continue;
+                    int bx = baseX + x;
+                    int by = baseY + y;
+                    int bz = baseZ + z;
+                    if (!isOwnedByCurrentRegion(world, bx >> 4, bz >> 4)) continue;
                     
-                    Block block = world.getBlockAt(
-                        location.getBlockX() + x,
-                        location.getBlockY() + y,
-                        location.getBlockZ() + z
-                    );
+                    Block block = world.getBlockAt(bx, by, bz);
                     
                     Material type = block.getType();
                     if (type == Material.CHORUS_PLANT || type == Material.CHORUS_FLOWER) {
                         Location treeLoc = block.getLocation().add(0.5, 0.5, 0.5);
-                        double distance = location.distance(treeLoc);
+                        double distance = location.distanceSquared(treeLoc);
                         if (distance < nearestDistance) {
                             nearestDistance = distance;
                             nearest = treeLoc;
@@ -425,73 +685,97 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     /** Radius (blocks) within which phantoms are considered "near a player" for stuck/tree logic. Saves work for distant phantoms. */
     private static final double MOVEMENT_MONITOR_PLAYER_RADIUS = 128.0;
     
-    private boolean isNearAnyPlayer(Location phantomLoc, List<Location> playerLocations) {
-        if (phantomLoc == null || playerLocations.isEmpty()) return false;
-        double radiusSq = MOVEMENT_MONITOR_PLAYER_RADIUS * MOVEMENT_MONITOR_PLAYER_RADIUS;
-        for (Location playerLoc : playerLocations) {
-            if (playerLoc != null && playerLoc.getWorld() == phantomLoc.getWorld()
-                    && phantomLoc.distanceSquared(playerLoc) <= radiusSq) return true;
-        }
-        return false;
-    }
-    
-    // Optimized method to monitor phantom movement, stuck detection, and tree avoidance, stuck detection, and tree avoidance
+    // Optimized method to monitor phantom movement, stuck detection, and tree avoidance
     private void monitorPhantomMovement() {
         if (!movementImprovementsEnabled) return;
         
         long currentTime = System.currentTimeMillis();
+        // Dedupe when multiple End players / chunk tasks share phantoms
+        Set<UUID> processed = ConcurrentHashMap.newKeySet();
         
-        for (World world : Bukkit.getWorlds()) {
-            if (world.getEnvironment() != World.Environment.THE_END) continue;
-            
-            List<Player> players = world.getPlayers();
-            if (players.isEmpty()) continue;
-            
-            // Only process phantoms near at least one player (stuck/tree logic is irrelevant far away)
-            List<Location> playerLocations = new ArrayList<>(players.size());
-            for (Player p : players) {
-                if (p.isValid() && !p.isDead()) playerLocations.add(p.getLocation());
-            }
-            if (playerLocations.isEmpty()) continue;
-            
-            Collection<Entity> entities = world.getEntities();
-            for (Entity entity : entities) {
-                if (!(entity instanceof Phantom)) continue;
-                
-                Phantom phantom = (Phantom) entity;
-                UUID phantomId = phantom.getUniqueId();
-                
-                if (!phantom.isValid() || phantom.isDead()) {
-                    cleanupPhantomData(phantomId);
-                    continue;
-                }
-                
-                Location currentLoc = phantom.getLocation();
-                if (!isNearAnyPlayer(currentLoc, playerLocations)) continue;
-                
-                handleStuckDetection(phantom, phantomId, currentLoc, currentTime);
-                
-                if (treeAvoidanceEnabled && isNearChorusFruit(currentLoc)) {
-                    long lastAvoidance = lastTreeAvoidanceTime.getOrDefault(phantomId, 0L);
-                    if (currentTime - lastAvoidance > 2000) {
-                        guidePhantomAroundTrees(phantom);
-                        lastTreeAvoidanceTime.put(phantomId, currentTime);
-                    }
-                }
-                
-                lastPhantomLocations.put(phantomId, currentLoc);
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            if (isFolia()) {
+                // Do not read player/world state from the global timer — schedule onto the player first
+                runAtEntity(player, () -> monitorPhantomsNearPlayer(player, processed, currentTime));
+            } else {
+                World world = player.getWorld();
+                if (world == null || world.getEnvironment() != World.Environment.THE_END) continue;
+                if (!player.isValid() || player.isDead()) continue;
+                monitorPhantomsNearPlayer(player, processed, currentTime);
             }
         }
-        // Prune stale UUIDs from aggressive set (phantoms removed without EntityDeathEvent)
-        if (!aggressivePhantoms.isEmpty()) {
-            List<UUID> toRemove = new ArrayList<>();
-            for (UUID uuid : aggressivePhantoms) {
-                if (Bukkit.getEntity(uuid) == null) toRemove.add(uuid);
+        
+        pruneStaleAggressivePhantoms();
+    }
+    
+    /**
+     * From the player's region, fan out per-chunk region tasks so entity access never crosses regions.
+     * Paper runs chunk work inline on the main thread.
+     */
+    private void monitorPhantomsNearPlayer(Player player, Set<UUID> processed, long currentTime) {
+        if (!player.isValid() || player.isDead()) return;
+        World world = player.getWorld();
+        if (world == null || world.getEnvironment() != World.Environment.THE_END) return;
+        
+        final Location playerLoc = player.getLocation().clone();
+        final double radiusSq = MOVEMENT_MONITOR_PLAYER_RADIUS * MOVEMENT_MONITOR_PLAYER_RADIUS;
+        
+        forEachChunkInRadius(playerLoc, MOVEMENT_MONITOR_PLAYER_RADIUS, (w, cx, cz) -> {
+            Runnable chunkWork = () -> {
+                if (!w.isChunkLoaded(cx, cz)) return;
+                for (Entity entity : w.getChunkAt(cx, cz).getEntities()) {
+                    if (!(entity instanceof Phantom)) continue;
+                    if (playerLoc.distanceSquared(entity.getLocation()) > radiusSq) continue;
+                    
+                    Phantom phantom = (Phantom) entity;
+                    UUID phantomId = phantom.getUniqueId();
+                    if (!processed.add(phantomId)) continue;
+                    processMonitoredPhantom(phantom, phantomId, currentTime);
+                }
+            };
+            if (isFolia()) {
+                runAtChunk(w, cx, cz, chunkWork);
+            } else {
+                chunkWork.run();
             }
-            for (UUID uuid : toRemove) {
-                aggressivePhantoms.remove(uuid);
-                cleanupPhantomData(uuid);
+        });
+    }
+    
+    private void processMonitoredPhantom(Phantom phantom, UUID phantomId, long currentTime) {
+        if (!phantom.isValid() || phantom.isDead()) {
+            removeAggressivePhantom(phantomId, "invalid during monitor");
+            cleanupPhantomData(phantomId);
+            return;
+        }
+        if (!isOwnedByCurrentRegion(phantom)) return;
+        
+        Location currentLoc = phantom.getLocation();
+        handleStuckDetection(phantom, phantomId, currentLoc, currentTime);
+        
+        if (treeAvoidanceEnabled && isNearChorusFruit(currentLoc)) {
+            long lastAvoidance = lastTreeAvoidanceTime.getOrDefault(phantomId, 0L);
+            if (currentTime - lastAvoidance > 2000) {
+                guidePhantomAroundTrees(phantom);
+                lastTreeAvoidanceTime.put(phantomId, currentTime);
             }
+        }
+        
+        lastPhantomLocations.put(phantomId, currentLoc);
+    }
+    
+    /**
+     * Paper: prune via UUID lookup on main thread.
+     * Folia: skip global getEntity — cleanup happens in monitor/death on the owning region.
+     */
+    private void pruneStaleAggressivePhantoms() {
+        if (isFolia() || aggressivePhantoms.isEmpty()) return;
+        List<UUID> toRemove = new ArrayList<>();
+        for (UUID uuid : aggressivePhantoms) {
+            if (Bukkit.getEntity(uuid) == null) toRemove.add(uuid);
+        }
+        for (UUID uuid : toRemove) {
+            aggressivePhantoms.remove(uuid);
+            cleanupPhantomData(uuid);
         }
     }
     
@@ -499,6 +783,11 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     private void handleStuckDetection(Phantom phantom, UUID phantomId, Location currentLoc, long currentTime) {
         Location lastLoc = lastPhantomLocations.get(phantomId);
         if (lastLoc == null) return;
+        if (lastLoc.getWorld() == null || currentLoc.getWorld() == null
+                || lastLoc.getWorld() != currentLoc.getWorld()) {
+            lastPhantomLocations.put(phantomId, currentLoc);
+            return;
+        }
         
         double distance = lastLoc.distance(currentLoc);
         
@@ -517,6 +806,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
                     // Too many attempts, remove the phantom
                     if (debugLogging) getLogger().info("Removing permanently stuck phantom " + phantomId);
                     phantom.remove();
+                    removeAggressivePhantom(phantomId, "permanently stuck");
                     cleanupPhantomData(phantomId);
                 }
             }
@@ -582,6 +872,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
 
     @Override
     public void onDisable() {
+        cancelAllTasks();
         aggressivePhantoms.clear();
         lastPhantomLocations.clear();
         stuckCounter.clear();
@@ -954,7 +1245,6 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         treeAvoidanceRadius = clamp(config.getDouble("phantom_settings.tree_avoidance_radius", 3.0), 1.0, 16.0, "tree_avoidance_radius");
         
         updateCheckerEnabled = config.getBoolean("update_checker", true);
-        random = new Random();
     }
     
     /** Clamp value to [min, max]; if clamped, log warning. Returns double for use with getInt/getDouble. */
@@ -999,8 +1289,8 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
             if (event.getTarget() == null) {
                 Player nearestPlayer = findNearestPlayer(phantom);
                 if (nearestPlayer != null) {
-                    // Schedule the re-targeting for next tick to avoid event conflicts
-                    runSync(() -> {
+                    // Schedule the re-targeting on the phantom's region (Folia-safe)
+                    runAtEntity(phantom, () -> {
                         if (phantom.isValid() && !phantom.isDead() && aggressivePhantoms.contains(phantomId)) {
                             phantom.setTarget(nearestPlayer);
                             if (debugLogging) getLogger().info("Re-targeted aggressive phantom " + phantomId + " to " + nearestPlayer.getName());
@@ -1023,17 +1313,38 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         }
     }
     
-    // Helper method to find the nearest player to a phantom
+    /**
+     * Nearest player within 64 blocks. Caller must already be on the phantom's region (event / entity task).
+     * Scans only chunks owned by the current region (Folia-safe; no cross-region getPlayers/getLocation).
+     */
     private Player findNearestPlayer(Phantom phantom) {
-        Player nearestPlayer = null;
-        double nearestDistance = Double.MAX_VALUE;
+        Location loc = phantom.getLocation();
+        World world = loc.getWorld();
+        if (world == null) return null;
         
-        for (Player player : phantom.getWorld().getPlayers()) {
-            if (player.isValid() && !player.isDead()) {
-                double distance = phantom.getLocation().distance(player.getLocation());
-                if (distance < nearestDistance && distance <= 64) { // Within 64 blocks
-                    nearestDistance = distance;
-                    nearestPlayer = player;
+        Player nearestPlayer = null;
+        double nearestDistanceSq = Double.MAX_VALUE;
+        final double maxRange = 64.0;
+        final double maxRangeSq = maxRange * maxRange;
+        
+        int minCX = (int) Math.floor((loc.getX() - maxRange) / 16.0);
+        int maxCX = (int) Math.floor((loc.getX() + maxRange) / 16.0);
+        int minCZ = (int) Math.floor((loc.getZ() - maxRange) / 16.0);
+        int maxCZ = (int) Math.floor((loc.getZ() + maxRange) / 16.0);
+        
+        for (int cx = minCX; cx <= maxCX; cx++) {
+            for (int cz = minCZ; cz <= maxCZ; cz++) {
+                if (!world.isChunkLoaded(cx, cz)) continue;
+                if (!isOwnedByCurrentRegion(world, cx, cz)) continue;
+                for (Entity entity : world.getChunkAt(cx, cz).getEntities()) {
+                    if (!(entity instanceof Player)) continue;
+                    Player player = (Player) entity;
+                    if (!player.isValid() || player.isDead()) continue;
+                    double distanceSq = loc.distanceSquared(player.getLocation());
+                    if (distanceSq <= maxRangeSq && distanceSq < nearestDistanceSq) {
+                        nearestDistanceSq = distanceSq;
+                        nearestPlayer = player;
+                    }
                 }
             }
         }
@@ -1080,8 +1391,8 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         // Make phantom aggressive immediately
         addAggressivePhantom(phantomId, "direct attack from " + damager.getName());
         
-        // Force the phantom to target the player immediately
-        runSync(() -> {
+        // Force the phantom to target the player on the phantom's region (Folia-safe)
+        runAtEntity(phantom, () -> {
             if (phantom.isValid() && !phantom.isDead()) {
                 phantom.setTarget(damager);
                 if (debugLogging) getLogger().info("Forced phantom " + phantomId + " to target " + damager.getName());
@@ -1135,31 +1446,160 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         if (!passivePhantomsEnabled || !customSpawnControl) return;
         if (endSpawnChance <= 0.0) return;
         
-        for (World world : Bukkit.getWorlds()) {
-            if (world.getEnvironment() != World.Environment.THE_END) continue;
+        for (Player targetPlayer : Bukkit.getOnlinePlayers()) {
+            // Chance roll is thread-safe; entity/world reads happen only on the correct thread below
+            if (ThreadLocalRandom.current().nextDouble() >= endSpawnChance) continue;
             
-            // Check if there are players in The End
-            if (world.getPlayers().isEmpty()) continue;
-            
-            // Attempt to spawn for every player in The End
-            for (Player targetPlayer : world.getPlayers()) {
-                if (random.nextDouble() < endSpawnChance) {
-                    Location playerLoc = targetPlayer.getLocation();
-                    int chunkX = playerLoc.getBlockX() >> 4;
-                    int chunkZ = playerLoc.getBlockZ() >> 4;
-                    // Cap by phantoms near player (radius), not just in chunk - phantoms fly so per-chunk alone would allow unlimited spawns
-                    int currentPhantomsNear = countPhantomsNear(world, playerLoc, spawnCheckRadius);
-                    if (currentPhantomsNear >= maxPhantomsPerChunk) {
-                        if (debugLogging) getLogger().info("Spawn cap reached near player at " + chunkX + "," + chunkZ + " (" + currentPhantomsNear + "/" + maxPhantomsPerChunk + " phantoms within " + (int)spawnCheckRadius + " blocks)");
-                        continue;
+            if (isFolia()) {
+                runAtEntity(targetPlayer, () -> spawnPhantomNearPlayer(targetPlayer));
+            } else {
+                World world = targetPlayer.getWorld();
+                if (world == null || world.getEnvironment() != World.Environment.THE_END) continue;
+                if (!targetPlayer.isValid() || targetPlayer.isDead()) continue;
+                spawnPhantomNearPlayer(targetPlayer);
+            }
+        }
+    }
+    
+    /** Must run on the player's region thread (Folia) or main thread (Paper). */
+    private void spawnPhantomNearPlayer(Player targetPlayer) {
+        if (!targetPlayer.isValid() || targetPlayer.isDead()) return;
+        World world = targetPlayer.getWorld();
+        if (world == null || world.getEnvironment() != World.Environment.THE_END) return;
+        
+        final Location playerLoc = targetPlayer.getLocation().clone();
+        final int chunkX = playerLoc.getBlockX() >> 4;
+        final int chunkZ = playerLoc.getBlockZ() >> 4;
+        
+        if (isFolia()) {
+            // Full multi-region count, then hop back to the player to spawn in their chunk
+            countPhantomsNearAsync(playerLoc, spawnCheckRadius, count -> {
+                if (count >= maxPhantomsPerChunk) {
+                    if (debugLogging) getLogger().info("Spawn cap reached near player at " + chunkX + "," + chunkZ + " (" + count + "/" + maxPhantomsPerChunk + " phantoms within " + (int)spawnCheckRadius + " blocks)");
+                    return;
+                }
+                runAtEntity(targetPlayer, () -> {
+                    if (!targetPlayer.isValid() || targetPlayer.isDead()) return;
+                    World w = targetPlayer.getWorld();
+                    if (w == null || w.getEnvironment() != World.Environment.THE_END) return;
+                    Location loc = targetPlayer.getLocation();
+                    int cx = loc.getBlockX() >> 4;
+                    int cz = loc.getBlockZ() >> 4;
+                    runAtChunk(w, cx, cz, () -> doSpawnPhantom(w, cx, cz, count));
+                });
+            });
+            return;
+        }
+        
+        int currentPhantomsNear = countPhantomsNear(world, playerLoc, spawnCheckRadius);
+        if (currentPhantomsNear >= maxPhantomsPerChunk) {
+            if (debugLogging) getLogger().info("Spawn cap reached near player at " + chunkX + "," + chunkZ + " (" + currentPhantomsNear + "/" + maxPhantomsPerChunk + " phantoms within " + (int)spawnCheckRadius + " blocks)");
+            return;
+        }
+        doSpawnPhantom(world, chunkX, chunkZ, currentPhantomsNear);
+    }
+    
+    /** Caller must own the target chunk region. */
+    private void doSpawnPhantom(World world, int chunkX, int chunkZ, int currentPhantomsNear) {
+        if (!isOwnedByCurrentRegion(world, chunkX, chunkZ)) return;
+        Location spawnLoc = findSafeSpawnLocation(world, chunkX, chunkZ);
+        Phantom phantom = world.spawn(spawnLoc, Phantom.class);
+        if (phantom != null) {
+            removeAggressivePhantom(phantom.getUniqueId(), "spawned");
+            if (debugLogging) getLogger().info("Spawned phantom in The End at " + spawnLoc + " (" + (currentPhantomsNear + 1) + "/" + maxPhantomsPerChunk + " near player)");
+        }
+    }
+    
+    /**
+     * Paper: full-world entity scan. Folia: per-chunk RegionScheduler counts near End players.
+     */
+    private void sendPhantomPopulations(CommandSender sender) {
+        if (!isFolia()) {
+            List<String> lines = new ArrayList<>();
+            for (World world : Bukkit.getWorlds()) {
+                if (world.getEnvironment() != World.Environment.THE_END) continue;
+                int totalPhantoms = 0;
+                for (Entity entity : world.getEntities()) {
+                    if (entity instanceof Phantom) totalPhantoms++;
+                }
+                lines.add("§7" + world.getName() + ": §a" + totalPhantoms + " total phantoms");
+            }
+            reply(sender, lines);
+            return;
+        }
+        
+        List<Player> players = new ArrayList<>(Bukkit.getOnlinePlayers());
+        if (players.isEmpty()) {
+            reply(sender, "§7No online players (Folia: counts phantoms near End players)");
+            return;
+        }
+        
+        Map<String, Set<UUID>> byWorld = new ConcurrentHashMap<>();
+        AtomicInteger pending = new AtomicInteger(players.size());
+        Runnable finishOne = () -> {
+            if (pending.decrementAndGet() == 0) {
+                List<String> lines = new ArrayList<>();
+                lines.add("§7(Folia: phantoms near online End players)");
+                if (byWorld.isEmpty()) {
+                    lines.add("§7No phantoms near End players");
+                } else {
+                    for (Map.Entry<String, Set<UUID>> entry : byWorld.entrySet()) {
+                        lines.add("§7" + entry.getKey() + ": §a" + entry.getValue().size() + " phantoms near players");
                     }
-                    // Spawn phantom at a safe location away from chorus fruit (still in player's chunk)
-                    Location spawnLoc = findSafeSpawnLocation(world, chunkX, chunkZ);
-                    Phantom phantom = world.spawn(spawnLoc, Phantom.class);
-                    if (phantom != null) {
-                        removeAggressivePhantom(phantom.getUniqueId(), "spawned");
-                        if (debugLogging) getLogger().info("Spawned phantom in The End at " + spawnLoc + " (" + (currentPhantomsNear + 1) + "/" + maxPhantomsPerChunk + " near player)");
+                }
+                reply(sender, lines);
+            }
+        };
+        
+        for (Player p : players) {
+            runAtEntity(p, () -> collectPhantomsNearPlayerForStatus(p, byWorld, finishOne), finishOne);
+        }
+    }
+    
+    /** Folia status helper: fan out per-chunk, then invoke done exactly once. */
+    private void collectPhantomsNearPlayerForStatus(Player p, Map<String, Set<UUID>> byWorld, Runnable done) {
+        if (!p.isValid() || p.isDead()) {
+            done.run();
+            return;
+        }
+        World w = p.getWorld();
+        if (w == null || w.getEnvironment() != World.Environment.THE_END) {
+            done.run();
+            return;
+        }
+        final Location loc = p.getLocation().clone();
+        final double radiusSq = MOVEMENT_MONITOR_PLAYER_RADIUS * MOVEMENT_MONITOR_PLAYER_RADIUS;
+        final Set<UUID> ids = byWorld.computeIfAbsent(w.getName(), n -> ConcurrentHashMap.newKeySet());
+        
+        final List<int[]> chunks = new ArrayList<>();
+        forEachChunkInRadius(loc, MOVEMENT_MONITOR_PLAYER_RADIUS, (world, cx, cz) -> chunks.add(new int[]{cx, cz}));
+        if (chunks.isEmpty()) {
+            done.run();
+            return;
+        }
+        
+        AtomicInteger pendingChunks = new AtomicInteger(chunks.size());
+        for (int[] chunk : chunks) {
+            final int cx = chunk[0];
+            final int cz = chunk[1];
+            Runnable work = () -> {
+                try {
+                    if (w.isChunkLoaded(cx, cz)) {
+                        for (Entity e : w.getChunkAt(cx, cz).getEntities()) {
+                            if (!(e instanceof Phantom)) continue;
+                            if (loc.distanceSquared(e.getLocation()) > radiusSq) continue;
+                            ids.add(e.getUniqueId());
+                        }
                     }
+                } finally {
+                    if (pendingChunks.decrementAndGet() == 0) {
+                        done.run();
+                    }
+                }
+            };
+            if (!runAtChunk(w, cx, cz, work)) {
+                if (pendingChunks.decrementAndGet() == 0) {
+                    done.run();
                 }
             }
         }
@@ -1178,14 +1618,12 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
         if (!updateCheckerEnabled || !event.getPlayer().hasPermission("passivephantoms.notify")) return;
-        runLater(() -> {
-            if (updateAvailable && latestVersion != null) {
-                org.bukkit.entity.Player p = event.getPlayer();
-                if (p != null && p.isOnline()) {
-                    p.sendMessage("§6[PassivePhantoms] §eUpdate available: §f" + latestVersion + " §7(current: " + getDescription().getVersion() + ")");
-                    p.sendMessage("§7Download: §fhttps://modrinth.com/plugin/" + MODRINTH_PROJECT_ID);
-                }
-            }
+        Player player = event.getPlayer();
+        runAtEntityLater(player, () -> {
+            if (!updateAvailable || latestVersion == null) return;
+            if (!player.isOnline()) return;
+            player.sendMessage("§6[PassivePhantoms] §eUpdate available: §f" + latestVersion + " §7(current: " + getDescription().getVersion() + ")");
+            player.sendMessage("§7Download: §fhttps://modrinth.com/plugin/" + MODRINTH_PROJECT_ID);
         }, 100L);
     }
 
@@ -1236,19 +1674,9 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
                     sender.sendMessage("§7Tree avoidance: §aEnabled (integrated with movement monitoring)");
                 }
                 
-                // Show phantom counts per End world (total)
+                // Show phantom counts per End world
                 sender.sendMessage("§6Phantom Populations:");
-                for (World world : Bukkit.getWorlds()) {
-                    if (world.getEnvironment() == World.Environment.THE_END) {
-                        int totalPhantoms = 0;
-                        for (Entity entity : world.getEntities()) {
-                            if (entity instanceof Phantom) {
-                                totalPhantoms++;
-                            }
-                        }
-                        sender.sendMessage("§7" + world.getName() + ": §a" + totalPhantoms + " total phantoms");
-                    }
-                }
+                sendPhantomPopulations(sender);
                 return true;
             } else if (args.length == 1 && args[0].equalsIgnoreCase("list")) {
                 if (!sender.hasPermission("passivephantoms.reload")) {
@@ -1256,20 +1684,36 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
                     return true;
                 }
                 if (aggressivePhantoms.isEmpty()) {
-                    sender.sendMessage("§7No aggressive phantoms currently tracked.");
+                    reply(sender, "§7No aggressive phantoms currently tracked.");
                 } else {
-                    sender.sendMessage("§6Aggressive Phantoms (" + aggressivePhantoms.size() + "):");
+                    reply(sender, "§6Aggressive Phantoms (" + aggressivePhantoms.size() + "):");
                     for (UUID phantomId : aggressivePhantoms) {
-                        // Try to find the actual phantom entity
                         Entity entity = Bukkit.getEntity(phantomId);
-                        
-                        if (entity != null && entity instanceof Phantom) {
-                            Phantom phantom = (Phantom) entity;
-                            String targetInfo = phantom.getTarget() != null ? 
-                                phantom.getTarget().getName() : "none";
-                            sender.sendMessage("§7- " + phantomId + " (target: " + targetInfo + ", alive: " + !phantom.isDead() + ")");
+                        if (!(entity instanceof Phantom)) {
+                            reply(sender, "§7- " + phantomId + " (entity not found - may be dead)");
+                            continue;
+                        }
+                        Phantom phantom = (Phantom) entity;
+                        final UUID id = phantomId;
+                        Runnable report = () -> {
+                            if (!phantom.isValid()) {
+                                reply(sender, "§7- " + id + " (entity not found - may be dead)");
+                                return;
+                            }
+                            String targetInfo = "none";
+                            try {
+                                if (phantom.getTarget() != null) {
+                                    targetInfo = phantom.getTarget().getName();
+                                }
+                            } catch (Exception ignored) {
+                                targetInfo = "unknown";
+                            }
+                            reply(sender, "§7- " + id + " (target: " + targetInfo + ", alive: " + !phantom.isDead() + ")");
+                        };
+                        if (isFolia()) {
+                            runAtEntity(phantom, report);
                         } else {
-                            sender.sendMessage("§7- " + phantomId + " (entity not found - may be dead)");
+                            report.run();
                         }
                     }
                 }

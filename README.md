@@ -17,8 +17,8 @@ A Minecraft Bukkit/Spigot plugin that makes phantoms spawn naturally in the end 
 
 ## Installation
 
-1. **Download**: Get the latest JAR file from the releases (v1.2.5)
-2. **Install**: Place `PassivePhantoms-1.2.5.jar` in your server's `plugins/` folder
+1. **Download**: Get the latest JAR file from the releases (v1.3.0-Dev1b)
+2. **Install**: Place `PassivePhantoms-1.3.0-Dev1b.jar` in your server's `plugins/` folder
 3. **(Recommended)**: If updating from an older version, delete the entire `PassivePhantoms` config folder and let the plugin generate a new one on next server start. This ensures you get all new config options and avoid legacy issues.
 4. **Restart**: Restart your server
 5. **Verify**: Check the console for "PassivePhantoms plugin enabled!" message
@@ -77,7 +77,8 @@ The plugin implements a per-chunk mobcap system to prevent infinite phantom spaw
 ## Compatibility
 
 - **Minecraft Version**: 1.13 - 1.21+
-- **Server Type**: Bukkit, Spigot, Paper
+- **Server Type**: Bukkit, Spigot, Paper, **Folia**
+- **Folia**: Fully supported (`folia-supported: true`). Entity/world work uses EntityScheduler and per-chunk RegionScheduler — never GlobalRegionScheduler for world access.
 - **Java Version**: 8 or higher
 
 ## Troubleshooting
