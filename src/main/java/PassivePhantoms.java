@@ -57,7 +57,7 @@ import java.util.function.IntConsumer;
 public class PassivePhantoms extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
 
     /** Config version in default config.yml; bump when adding/removing options so user config is merged. */
-    private static final int CONFIG_VERSION = 2;
+    private static final int CONFIG_VERSION = 3;
     /** Modrinth API v2: GET /project/{id|slug}/version returns JSON array; first item has version_number. */
     private static final String MODRINTH_VERSION_URL = "https://api.modrinth.com/v2/project/%s/version";
     private static final String MODRINTH_PROJECT_ID = "passivephantoms";
@@ -1179,13 +1179,34 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     private String formatYamlValue(Object value) {
         if (value == null) return "null";
         if (value instanceof String) {
-            String str = (String) value;
-            if (str.contains(":") || str.contains("#") || str.trim().isEmpty() || str.equalsIgnoreCase("true") || str.equalsIgnoreCase("false") || str.equalsIgnoreCase("null") || str.matches("^-?\\d+$"))
-                return "\"" + str.replace("\"", "\\\"") + "\"";
-            return str;
+            // Always double-quote strings so migration round-trips safely through SnakeYAML.
+            return "\"" + escapeForYamlDoubleQuotedString((String) value) + "\"";
         }
         if (value instanceof Boolean || value instanceof Number) return value.toString();
         return value.toString();
+    }
+
+    private String escapeForYamlDoubleQuotedString(String str) {
+        StringBuilder sb = new StringBuilder(str.length() + 8);
+        for (int i = 0; i < str.length(); i++) {
+            char c = str.charAt(i);
+            if (c == '\\') {
+                sb.append("\\\\");
+            } else if (c == '"') {
+                sb.append("\\\"");
+            } else if (c == '\n') {
+                sb.append("\\n");
+            } else if (c == '\r') {
+                sb.append("\\r");
+            } else if (c == '\t') {
+                sb.append("\\t");
+            } else if (c < 0x20) {
+                sb.append(String.format("\\u%04x", (int) c));
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
     }
     
     private void updateConfigVersion(List<String> lines, int newVersion, List<String> defaultLines, String versionKey) {

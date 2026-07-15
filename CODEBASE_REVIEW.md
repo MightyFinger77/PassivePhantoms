@@ -10,12 +10,10 @@
 - Tracking maps are `ConcurrentHashMap` / concurrent sets for multi-region access.
 - Scheduled tasks are tracked and cancelled in `onDisable`.
 
-## What works well
+## Correct base preserved
 
-- Passive/aggressive UUID tracking with death + monitor cleanup.
-- End spawn control with radius-based caps (Folia: async multi-chunk count).
-- Movement stuck/tree logic scoped to End players / nearby chunks.
-- Config migration and Modrinth update checker (async HTTP → global sync for flags).
+- `CONFIG_VERSION = 3` and decorative default `config.yml` header from Dev1b.
+- Always double-quote YAML string migration (`escapeForYamlDoubleQuotedString`).
 
 ## Folia rules (do not regress)
 

@@ -1,16 +1,22 @@
 # Changelog
 
-## 1.3.0-Dev1b (2026-07-11)
+## 1.3.0-Dev1b (2026-07-15)
 
 ### Fixed
-- Folia: full region-safe rewrite — no `getNearbyEntities` / world-wide `getEntities` on Folia paths.
-- Entity/world work uses EntityScheduler + per-chunk RegionScheduler; GlobalRegionScheduler only for non-world dispatch.
-- Spawn caps count across regions via async per-chunk aggregation; movement monitor fans out per owned chunk.
+- Folia: full region-safe rewrite on the correct Dev1b base (config v3 + decorative header preserved).
+- No `getNearbyEntities` / world-wide `getEntities` on Folia paths; uses EntityScheduler + per-chunk RegionScheduler.
+- Spawn caps count across regions; movement monitor fans out per owned chunk.
 - Block scans / escape teleports gated with `isOwnedByCurrentRegion`; timers cancelled on disable.
-- Scheduler reflection failures log and abort (no silent fallback to unsupported Bukkit scheduler on Folia).
+- Scheduler reflection failures log and abort (no silent Bukkit fallback on Folia).
 - Paper path preserved: main-thread inline world work; status still uses full-world counts.
 
 ---
+
+## [1.3.0-Dev1b] - 2026-03-21
+
+### Changed
+- Decorative default config header; `config_version` → 3.
+
 
 ## 1.3.0-Dev1a (2026-03-19)
 

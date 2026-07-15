@@ -1,0 +1,82 @@
+[b]PassivePhantoms[/b] changes how phantoms behave on [b]Paper[/b] and [b]Folia[/b]. They stay [b]passive[/b] until a player hits them or a player-shot projectile does. Optional [b]End-only[/b] spawning with caps, [b]stuck[/b] handling, and [b]chorus-tree[/b] avoidance keep end skies interesting without the usual chaos.
+
+[b]Version[/b] [b]1.3.0-Dev1b[/b] (see [b]pom.xml[/b] when building from source). [b]Java[/b] 8+ per project build. [b]API[/b] 1.13+.
+
+[b]Downloads and changelog:[/b] [url=https://modrinth.com/plugin/passivephantoms]Modrinth — PassivePhantoms[/url]
+
+Prefer Modrinth for the newest builds. SpigotMC listings may lag.
+
+[b]Support[/b] through GitHub issues, Discord [b]#plugin-help[/b], or Modrinth comments. Please do not use resource reviews as tech support.
+
+[b]Features[/b]
+
+[list]
+[*][b]Passive by default[/b] Phantoms do not hunt players until provoked. Then they behave like angry vanilla phantoms.
+[*][b]Projectile provocation[/b] Arrows, tridents, snowballs, and similar player projectiles can trigger aggression.
+[*][b]Custom spawn control[/b] When enabled, overworld phantom spawns from this plugin are off. End spawning uses your chance and interval from [b]config.yml[/b].
+[*][b]Spawn cap[/b] Limit how many phantoms count near each player using [b]max_phantoms_per_chunk[/b] and [b]spawn_check_radius[/b].
+[*][b]Movement help[/b] Stuck detection and optional [b]tree_avoidance[/b] nudge phantoms away from chorus clutter. Still experimental around dense chorus.
+[*][b]Master switch[/b] [b]passive_phantoms_enabled[/b] restores full vanilla phantom behavior when false.
+[*][b]Update checker[/b] Optional. Ops with [b]passivephantoms.notify[/b] can see in-game notices.
+[/list]
+
+[b]Commands[/b] [b]/passivephantoms[/b]
+
+[list]
+[*]No args shows version and usage.
+[*][b]reload[/b] Reload [b]config.yml[/b]. Needs [b]passivephantoms.reload[/b].
+[*][b]debug[/b] Toggle debug logging at runtime.
+[*][b]status[/b] Plugin status and phantom-related info.
+[*][b]list[/b] List currently aggressive phantoms.
+[/list]
+
+[b]Permissions[/b]
+
+[list]
+[*][b]passivephantoms.reload[/b] default op. Reload command.
+[*][b]passivephantoms.notify[/b] default op. Update notifications on join when a new version exists.
+[/list]
+
+[b]Config outline[/b] [b]config.yml[/b]
+
+[code]
+config_version: 3
+
+debug_logging: false
+passive_phantoms_enabled: true
+update_checker: true
+
+phantom_settings:
+  custom_spawn_control: true
+  end_spawn_chance: 0.05
+  end_spawn_interval_ticks: 200
+  max_phantoms_per_chunk: 8
+  spawn_check_radius: 64.0
+  movement_improvements_enabled: true
+  stuck_detection_ticks: 100
+  stuck_threshold: 3
+  stuck_distance_threshold: 1.0
+  max_stuck_attempts: 5
+  tree_avoidance_enabled: true
+  tree_avoidance_radius: 3.0
+[/code]
+
+[b]Installation[/b]
+
+[list]
+[*]Download the JAR from [url=https://modrinth.com/plugin/passivephantoms]Modrinth[/url].
+[*]Place it in the [b]plugins[/b] folder.
+[*]Start or restart the server. Edit [b]config.yml[/b] then [b]/passivephantoms reload[/b] or restart.
+[/list]
+
+[b]Updating[/b]
+
+[list]
+[*]Back up [b]plugins/PassivePhantoms/[/b].
+[*]Replace the JAR and restart or reload config.
+[*]Compare your [b]config.yml[/b] with new defaults and merge new keys if you skip a full reset.
+[/list]
+
+[b]Support[/b]
+
+GitHub issues, Discord [b]#plugin-help[/b], or Modrinth. Thanks for using PassivePhantoms.

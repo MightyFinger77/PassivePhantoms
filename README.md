@@ -76,9 +76,9 @@ The plugin implements a per-chunk mobcap system to prevent infinite phantom spaw
 
 ## Compatibility
 
-- **Minecraft Version**: 1.13 - 1.21+
+- **Minecraft Version**: 1.13 – 1.21+ / 26.x
 - **Server Type**: Bukkit, Spigot, Paper, **Folia**
-- **Folia**: Fully supported (`folia-supported: true`). Entity/world work uses EntityScheduler and per-chunk RegionScheduler — never GlobalRegionScheduler for world access.
+- **Folia**: Fully supported (`folia-supported: true`). Entity/world work uses EntityScheduler and per-chunk RegionScheduler.
 - **Java Version**: 8 or higher
 
 ## Troubleshooting
