@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.0-Dev2a (2026-07-15)
+
+### Added
+- Config options `allow_overworld_spawning` (default: false) and `allow_end_spawning` (default: true) under `phantom_settings` when `custom_spawn_control` is enabled.
+- Overworld spawns (when allowed) and End spawns enforce the per-chunk cap; End spawns are cancelled when `allow_end_spawning` is false.
+- Status command and debug startup logs report both allow flags.
+- Locktight-style update flow: `/passivephantoms update`, join notify for ops/`passivephantoms.notify`, and notify online admins when an update is detected.
+
+### Changed
+- `config_version` → 4 (migration merges new keys and updated comments).
+- Version metadata (`pom.xml`, `plugin.yml`, `VERSION`, `compile.bat`) set to `1.3.0-Dev2a`.
+- Removed blanket command permission so subcommands can use their own perms (`passivephantoms.update`).
+
+---
+
 ## 1.3.0-Dev1b (2026-07-15)
 
 ### Fixed

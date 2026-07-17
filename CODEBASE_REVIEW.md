@@ -1,4 +1,4 @@
-# PassivePhantoms Codebase Review (1.3.0-Dev1b)
+# PassivePhantoms Codebase Review (1.3.0-Dev2a)
 
 ## Threading model
 
@@ -12,7 +12,7 @@
 
 ## Correct base preserved
 
-- `CONFIG_VERSION = 3` and decorative default `config.yml` header from Dev1b.
+- `CONFIG_VERSION = 4` with decorative default `config.yml` header; spawn dimension flags: `allow_overworld_spawning`, `allow_end_spawning`.
 - Always double-quote YAML string migration (`escapeForYamlDoubleQuotedString`).
 
 ## Folia rules (do not regress)

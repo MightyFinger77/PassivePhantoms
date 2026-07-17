@@ -27,7 +27,7 @@
 #                             by MightyFinger77                             
 # ╰─────────────────────────────────────────────────────────────────────────────╯
 #
-config_version: 3
+config_version: 4
 
 # Enable/disable debug logging (console messages for targeting, spawns, stuck detection)
 debug_logging: false
@@ -40,8 +40,14 @@ update_checker: true
 
 # Phantom behavior settings
 phantom_settings:
-  # When true: no phantom spawns in Overworld; End spawns via task below. When false: vanilla spawns only.
+  # When true: plugin controls where phantoms spawn (see allow_* below). When false: vanilla spawns only.
   custom_spawn_control: true
+  
+  # Allow vanilla phantom spawns in the Overworld when custom_spawn_control is true. Default: false
+  allow_overworld_spawning: false
+  
+  # Allow custom phantom spawns in The End when custom_spawn_control is true. Default: true
+  allow_end_spawning: true
   
   # Chance per player per spawn interval to spawn one phantom in The End. Valid: 0.0 to 1.0
   end_spawn_chance: 0.05
@@ -82,8 +88,8 @@ phantom_settings:
 # - Phantoms start passive and won't target players
 # - Phantoms become aggressive when hit by players or projectiles (arrows, tridents, etc.)
 # - Once aggressive, phantoms will target and attack players normally
-# - Custom spawn control prevents phantoms from spawning in the Overworld
-# - Phantoms can spawn in The End based on the configured chance
+# - Custom spawn control uses allow_overworld_spawning / allow_end_spawning (defaults: Overworld off, End on)
+# - Phantoms can spawn in The End based on the configured chance when allow_end_spawning is true
 # - Per-chunk mobcap prevents infinite spawning and ensures fair distribution
 # - Movement improvements help phantoms avoid getting stuck and fly around chorus fruit trees naturally
 # - Stuck detection automatically helps or removes phantoms that can't move

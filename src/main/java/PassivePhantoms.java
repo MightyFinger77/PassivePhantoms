@@ -57,7 +57,7 @@ import java.util.function.IntConsumer;
 public class PassivePhantoms extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
 
     /** Config version in default config.yml; bump when adding/removing options so user config is merged. */
-    private static final int CONFIG_VERSION = 3;
+    private static final int CONFIG_VERSION = 4;
     /** Modrinth API v2: GET /project/{id|slug}/version returns JSON array; first item has version_number. */
     private static final String MODRINTH_VERSION_URL = "https://api.modrinth.com/v2/project/%s/version";
     private static final String MODRINTH_PROJECT_ID = "passivephantoms";
@@ -65,6 +65,8 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     private volatile boolean debugLogging;
     private volatile boolean passivePhantomsEnabled;
     private volatile boolean customSpawnControl;
+    private volatile boolean allowOverworldSpawning;
+    private volatile boolean allowEndSpawning;
     private volatile double endSpawnChance;
     private volatile int maxPhantomsPerChunk;
     /** Radius (blocks) around player to count phantoms for cap; prevents flying phantoms from bypassing by leaving chunk. */
@@ -846,7 +848,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         getCommand("passivephantoms").setTabCompleter(this);
         
         // Start custom phantom spawning in The End if enabled
-        if (passivePhantomsEnabled && customSpawnControl) {
+        if (passivePhantomsEnabled && customSpawnControl && allowEndSpawning) {
             long interval = endSpawnIntervalTicks;
             runTimer(this::spawnPhantomsInEnd, interval, interval);
         }
@@ -858,13 +860,15 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
             }, stuckDetectionTicks, stuckDetectionTicks);
         }
         
-        runUpdateCheckAsync();
+        checkForUpdates();
         getLogger().info("PassivePhantoms plugin enabled!");
         if (debugLogging) {
             getLogger().info("Debug logging: ENABLED");
             getLogger().info("Passive phantoms: " + (passivePhantomsEnabled ? "ENABLED" : "DISABLED"));
             if (customSpawnControl) {
                 getLogger().info("Custom spawn control: ENABLED");
+                getLogger().info("Allow Overworld spawning: " + allowOverworldSpawning);
+                getLogger().info("Allow End spawning: " + allowEndSpawning);
                 getLogger().info("End spawn chance: " + (endSpawnChance * 100) + "%");
             }
         }
@@ -882,9 +886,40 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         getLogger().info("PassivePhantoms plugin disabled!");
     }
     
-    /** Modrinth update check (async); notifies console and players with permission on join. */
-    private void runUpdateCheckAsync() {
-        if (!updateCheckerEnabled) return;
+    private boolean canReceiveUpdateNotify(Player player) {
+        return player != null && (player.isOp() || player.hasPermission("passivephantoms.notify"));
+    }
+
+    private void sendUpdateAvailableMessage(CommandSender sender, String latest, String current) {
+        String downloadUrl = "https://modrinth.com/plugin/" + MODRINTH_PROJECT_ID;
+        sender.sendMessage("§6[PassivePhantoms] §eUpdate available: §f" + latest + " §7(current: " + current + ")");
+        sender.sendMessage("§6[PassivePhantoms] §7Download: §f" + downloadUrl);
+    }
+
+    /** Startup / background Modrinth check. */
+    private void checkForUpdates() {
+        checkForUpdates(null);
+    }
+
+    /** Manual check from /passivephantoms update (optional player feedback). */
+    public void checkForUpdatesManually(Player player) {
+        if (!updateCheckerEnabled) {
+            getLogger().info("Update checking is disabled in config");
+            if (player != null) {
+                player.sendMessage("§c[PassivePhantoms] Update checking is disabled in config");
+            }
+            return;
+        }
+        getLogger().info("Manually checking for updates...");
+        checkForUpdates(player);
+    }
+
+    /**
+     * Modrinth update check (async). When an update is found: console log, optional requester message,
+     * then notify online ops / notify-perm players after a short delay (Locktight-style).
+     */
+    private void checkForUpdates(Player player) {
+        if (!updateCheckerEnabled && player == null) return;
         runAsync(() -> {
             try {
                 HttpURLConnection conn = (HttpURLConnection) URI.create(String.format(MODRINTH_VERSION_URL, MODRINTH_PROJECT_ID)).toURL().openConnection();
@@ -892,26 +927,64 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
                 conn.setConnectTimeout(5000);
                 conn.setReadTimeout(5000);
                 conn.setRequestProperty("User-Agent", "PassivePhantoms/" + getDescription().getVersion() + " (MightyFinger77)");
-                if (conn.getResponseCode() != 200) {
+                int responseCode = conn.getResponseCode();
+                if (responseCode != 200) {
                     conn.disconnect();
+                    if (player != null) {
+                        runSync(() -> player.sendMessage("§c[PassivePhantoms] Could not check for updates: API returned " + responseCode));
+                    } else if (debugLogging) {
+                        getLogger().warning("Update check failed: API returned " + responseCode);
+                    }
                     return;
                 }
                 String body = readFully(conn.getInputStream());
                 conn.disconnect();
                 String fetchedVersion = parseModrinthVersionNumber(body);
-                if (fetchedVersion == null || fetchedVersion.isEmpty()) return;
+                if (fetchedVersion == null || fetchedVersion.isEmpty()) {
+                    if (player != null) {
+                        runSync(() -> player.sendMessage("§c[PassivePhantoms] Could not check for updates: invalid response"));
+                    }
+                    return;
+                }
                 String currentVersion = getDescription().getVersion();
                 final String latest = fetchedVersion.trim();
+                if (debugLogging) {
+                    getLogger().info("[DEBUG] Update check - Modrinth: '" + latest + "', current: '" + currentVersion + "'");
+                }
                 final boolean newer = isNewerVersion(latest, currentVersion);
                 runSync(() -> {
                     latestVersion = latest;
                     updateAvailable = newer;
                     if (newer) {
+                        String downloadUrl = "https://modrinth.com/plugin/" + MODRINTH_PROJECT_ID;
                         getLogger().info("[PassivePhantoms] Update available: " + latest + " (current: " + currentVersion + ")");
-                        getLogger().info("[PassivePhantoms] Download: https://modrinth.com/plugin/" + MODRINTH_PROJECT_ID);
+                        getLogger().info("[PassivePhantoms] Download: " + downloadUrl);
+                        if (player != null) {
+                            sendUpdateAvailableMessage(player, latest, currentVersion);
+                        }
+                        // Notify other online admins after MOTD delay (skip the requester who already got it)
+                        for (Player online : Bukkit.getOnlinePlayers()) {
+                            if (!canReceiveUpdateNotify(online)) continue;
+                            if (player != null && online.equals(player)) continue;
+                            runAtEntityLater(online, () -> {
+                                if (!online.isOnline()) return;
+                                sendUpdateAvailableMessage(online, latest, currentVersion);
+                            }, 100L);
+                        }
+                    } else if (player != null) {
+                        player.sendMessage("§a[PassivePhantoms] §aPlugin is up to date (version " + currentVersion + ")");
+                    } else if (debugLogging) {
+                        getLogger().info("[DEBUG] Plugin is up to date (version " + currentVersion + ")");
                     }
                 });
-            } catch (Exception ignored) { }
+            } catch (Exception e) {
+                if (debugLogging) {
+                    getLogger().warning("Could not check for updates: " + e.getMessage());
+                }
+                if (player != null) {
+                    runSync(() -> player.sendMessage("§c[PassivePhantoms] Could not check for updates: " + e.getMessage()));
+                }
+            }
         });
     }
     
@@ -1247,6 +1320,8 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         debugLogging = config.getBoolean("debug_logging", false);
         passivePhantomsEnabled = config.getBoolean("passive_phantoms_enabled", true);
         customSpawnControl = config.getBoolean("phantom_settings.custom_spawn_control", true);
+        allowOverworldSpawning = config.getBoolean("phantom_settings.allow_overworld_spawning", false);
+        allowEndSpawning = config.getBoolean("phantom_settings.allow_end_spawning", true);
         
         // Spawn settings with validation (invalid values clamped, no crash)
         endSpawnChance = clamp(config.getDouble("phantom_settings.end_spawn_chance", 0.05), 0.0, 1.0, "end_spawn_chance");
@@ -1445,14 +1520,29 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
         World world = event.getLocation().getWorld();
         if (world == null) return;
         
-        // Cancel phantom spawning in the Overworld
+        // Cancel phantom spawning in the Overworld unless explicitly allowed
         if (world.getEnvironment() == World.Environment.NORMAL) {
-            event.setCancelled(true);
-            if (debugLogging) getLogger().info("Cancelled phantom spawn in Overworld");
+            if (!allowOverworldSpawning) {
+                event.setCancelled(true);
+                if (debugLogging) getLogger().info("Cancelled phantom spawn in Overworld");
+                return;
+            }
+            // Allowed Overworld: still enforce per-chunk cap
+            int chunkX = event.getLocation().getBlockX() >> 4;
+            int chunkZ = event.getLocation().getBlockZ() >> 4;
+            if (countPhantomsInChunk(world, chunkX, chunkZ) >= maxPhantomsPerChunk) {
+                event.setCancelled(true);
+                if (debugLogging) getLogger().info("Cancelled phantom spawn in Overworld (chunk " + chunkX + "," + chunkZ + " at cap " + maxPhantomsPerChunk + ")");
+            }
             return;
         }
-        // In The End: enforce per-chunk cap for any spawn source (our task uses radius cap; this catches others)
+        // In The End: cancel if End spawning is disabled; otherwise enforce per-chunk cap
         if (world.getEnvironment() == World.Environment.THE_END) {
+            if (!allowEndSpawning) {
+                event.setCancelled(true);
+                if (debugLogging) getLogger().info("Cancelled phantom spawn in The End (allow_end_spawning is false)");
+                return;
+            }
             int chunkX = event.getLocation().getBlockX() >> 4;
             int chunkZ = event.getLocation().getBlockZ() >> 4;
             if (countPhantomsInChunk(world, chunkX, chunkZ) >= maxPhantomsPerChunk) {
@@ -1464,7 +1554,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     
     // Custom phantom spawning in The End
     public void spawnPhantomsInEnd() {
-        if (!passivePhantomsEnabled || !customSpawnControl) return;
+        if (!passivePhantomsEnabled || !customSpawnControl || !allowEndSpawning) return;
         if (endSpawnChance <= 0.0) return;
         
         for (Player targetPlayer : Bukkit.getOnlinePlayers()) {
@@ -1638,13 +1728,15 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
     
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
-        if (!updateCheckerEnabled || !event.getPlayer().hasPermission("passivephantoms.notify")) return;
+        if (!updateCheckerEnabled || !updateAvailable || latestVersion == null) return;
         Player player = event.getPlayer();
+        if (!canReceiveUpdateNotify(player)) return;
+        final String latest = latestVersion;
+        final String current = getDescription().getVersion();
+        // Delay so the message shows after MOTD (Locktight-style)
         runAtEntityLater(player, () -> {
-            if (!updateAvailable || latestVersion == null) return;
-            if (!player.isOnline()) return;
-            player.sendMessage("§6[PassivePhantoms] §eUpdate available: §f" + latestVersion + " §7(current: " + getDescription().getVersion() + ")");
-            player.sendMessage("§7Download: §fhttps://modrinth.com/plugin/" + MODRINTH_PROJECT_ID);
+            if (!player.isOnline() || !updateAvailable) return;
+            sendUpdateAvailableMessage(player, latest, current);
         }, 100L);
     }
 
@@ -1681,6 +1773,8 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
                 sender.sendMessage("§7Plugin enabled: §a" + passivePhantomsEnabled);
                 sender.sendMessage("§7Debug logging: §a" + debugLogging);
                 sender.sendMessage("§7Custom spawn control: §a" + customSpawnControl);
+                sender.sendMessage("§7Allow Overworld spawning: §a" + allowOverworldSpawning);
+                sender.sendMessage("§7Allow End spawning: §a" + allowEndSpawning);
                 sender.sendMessage("§7End spawn chance: §a" + (endSpawnChance * 100) + "% §7(every " + (endSpawnIntervalTicks / 20) + "s)");
                 sender.sendMessage("§7Movement improvements: §a" + movementImprovementsEnabled);
                 sender.sendMessage("§7Aggressive phantoms tracked: §a" + aggressivePhantoms.size());
@@ -1739,12 +1833,25 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
                     }
                 }
                 return true;
+            } else if (args.length == 1 && args[0].equalsIgnoreCase("update")) {
+                if (!sender.hasPermission("passivephantoms.update") && !sender.hasPermission("passivephantoms.notify")) {
+                    sender.sendMessage("§cYou don't have permission to use this command!");
+                    return true;
+                }
+                sender.sendMessage("§e[PassivePhantoms] Checking for updates...");
+                if (sender instanceof Player) {
+                    checkForUpdatesManually((Player) sender);
+                } else {
+                    checkForUpdatesManually(null);
+                }
+                return true;
             } else if (args.length == 0) {
                 sender.sendMessage("§6PassivePhantoms v" + getDescription().getVersion());
                 sender.sendMessage("§7Use §f/passivephantoms reload §7to reload the configuration");
                 sender.sendMessage("§7Use §f/passivephantoms debug §7to toggle debug logging");
                 sender.sendMessage("§7Use §f/passivephantoms status §7to check plugin status");
                 sender.sendMessage("§7Use §f/passivephantoms list §7to list aggressive phantoms");
+                sender.sendMessage("§7Use §f/passivephantoms update §7to check for updates");
                 return true;
             }
         }
@@ -1763,6 +1870,7 @@ public class PassivePhantoms extends JavaPlugin implements Listener, CommandExec
                 options.add("debug");
                 options.add("status");
                 options.add("list");
+                options.add("update");
                 
                 // Filter based on what user has typed
                 List<String> filtered = new ArrayList<>();

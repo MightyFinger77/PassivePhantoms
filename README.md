@@ -6,7 +6,7 @@ A Minecraft Bukkit/Spigot plugin that makes phantoms spawn naturally in the end 
 
 ## How It Works
 
-1. **Natural Spawning**: Phantoms spawn normally in the end (no overworld spawning)
+1. **Natural Spawning**: With custom spawn control, End spawns are enabled by default; Overworld is off unless `allow_overworld_spawning` is true
 2. **Passive Behavior**: New phantoms are completely passive and won't target players
 3. **Provocation**: When a player attacks a phantom (melee or projectile), it becomes "angry" and can attack back
 4. **Projectile Aggression**: Phantoms also become aggressive when hit by arrows, tridents, snowballs, or other projectiles
@@ -17,8 +17,8 @@ A Minecraft Bukkit/Spigot plugin that makes phantoms spawn naturally in the end 
 
 ## Installation
 
-1. **Download**: Get the latest JAR file from the releases (v1.3.0-Dev1b)
-2. **Install**: Place `PassivePhantoms-1.3.0-Dev1b.jar` in your server's `plugins/` folder
+1. **Download**: Get the latest JAR file from the releases (v1.3.0-Dev2a)
+2. **Install**: Place `PassivePhantoms-1.3.0-Dev2a.jar` in your server's `plugins/` folder
 3. **(Recommended)**: If updating from an older version, delete the entire `PassivePhantoms` config folder and let the plugin generate a new one on next server start. This ensures you get all new config options and avoid legacy issues.
 4. **Restart**: Restart your server
 5. **Verify**: Check the console for "PassivePhantoms plugin enabled!" message
@@ -30,6 +30,8 @@ The plugin generates a `config.yml` file on first run with the following options
 - `debug_logging`: Enable/disable debug messages (default: false)
 - `passive_phantoms_enabled`: Enable/disable the plugin (default: true)
 - `phantom_settings.custom_spawn_control`: Control phantom spawning (default: true)
+- `phantom_settings.allow_overworld_spawning`: Allow vanilla Overworld phantom spawns when custom spawn control is on (default: false)
+- `phantom_settings.allow_end_spawning`: Allow custom End phantom spawns when custom spawn control is on (default: true)
 - `phantom_settings.end_spawn_chance`: Chance for phantoms to spawn in The End (default: 0.05 = 5%)
 - `phantom_settings.max_phantoms_per_chunk`: Maximum phantoms per chunk (default: 8)
 - `phantom_settings.movement_improvements_enabled`: Enable movement improvements (default: true)
@@ -45,10 +47,13 @@ The plugin generates a `config.yml` file on first run with the following options
 - `/passivephantoms debug` - Toggle debug logging
 - `/passivephantoms status` - Check plugin status and phantom populations
 - `/passivephantoms list` - List aggressive phantoms
+- `/passivephantoms update` - Check Modrinth for a newer version
 
 ## Permissions
 
 - `passivephantoms.reload` - Allows reloading the configuration (default: op)
+- `passivephantoms.notify` - Receive update notice on join when outdated (default: op)
+- `passivephantoms.update` - Allows `/passivephantoms update` (default: op)
 
 ## Mobcap System
 

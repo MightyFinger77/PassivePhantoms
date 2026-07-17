@@ -1,5 +1,5 @@
 name: PassivePhantoms
-version: '1.3.0-Dev1b'
+version: '1.3.0-Dev2a'
 main: PassivePhantoms
 api-version: 1.13
 description: Makes phantoms passive until they are attacked by a player or projectile. Features per-chunk mobcap and movement improvements to prevent phantoms from getting stuck.
@@ -8,9 +8,8 @@ authors: [MightyFinger77]
 
 commands:
   passivephantoms:
-    description: Reload the PassivePhantoms configuration
-    usage: /<command> [reload|debug|status|list]
-    permission: passivephantoms.reload
+    description: PassivePhantoms admin commands
+    usage: /<command> [reload|debug|status|list|update]
 
 permissions:
   passivephantoms.reload:
@@ -18,6 +17,9 @@ permissions:
     default: op
   passivephantoms.notify:
     description: Receive update notification on join when a new version is available
+    default: op
+  passivephantoms.update:
+    description: Allows manually checking for plugin updates via /passivephantoms update
     default: op
 folia-supported: true
 
